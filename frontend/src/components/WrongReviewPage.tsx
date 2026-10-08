@@ -30,6 +30,7 @@ import type {
   ReviewDashboard,
   ReviewRecord,
   ReviewStatus,
+  TopicProgress,
 } from '../types'
 
 interface WrongReviewPageProps {
@@ -81,7 +82,35 @@ function accuracyColor(accuracy: number): string {
   if (accuracy >= 0.6) return 'bg-amber-500'
   return 'bg-red-500'
 }
+function topicPriorityScore(topic: TopicProgress): number {
+  const lastAnswerCorrect = topic.streak === 0 ? 0 : 1
+  return topic.accuracy * 0.65 + lastAnswerCorrect * 0.35
+}
 
+function priorityAdvice(topic: TopicProgress): string {
+  const percent = Math.round(topic.accuracy * 100)
+  const missingTypes = (['single', 'multiple', 'judge'] as const).filter(
+    (type) => (topic.by_type?.[type]?.correct ?? 0) === 0,
+  )
+  const missingLabels = missingTypes.map((type) => TYPE_LABEL[type]).join('、')
+
+  if (topic.total < 4) {
+    return `当前只有 ${topic.total} 道样本，先补 ${4 - topic.total} 道后再判断；已通过题型要和新题型混合练。`
+  }
+  if (topic.accuracy < 0.6) {
+    return `正确率仅 ${percent}%，先回读对应原资料和错题解析，再用单选题、判断题补基础，不要直接上难题。`
+  }
+  if (missingTypes.length > 0 && !topic.cross_type_verified) {
+    return `已通过的题型还不够，建议下一套优先加入${missingLabels}，确认换题型后仍能讲清。`
+  }
+  if (topic.streak < 2) {
+    return `当前正确率 ${percent}%，但最近连续答对不足 2 次；再做一组混合题确认不是短期记忆。`
+  }
+  if (topic.accuracy < 0.85) {
+    return `正确率 ${percent}%，尚未达到 85%；优先用错题场景变形，隔天再复测一次。`
+  }
+  return `当前正确率 ${percent}%，保持 1 天 / 3 天 / 7 天 / 15 天间隔复习即可。`
+}
 export function WrongReviewPage({
   onPaperReady,
   onBackToQuiz,
@@ -125,11 +154,11 @@ export function WrongReviewPage({
     void loadData()
   }, [loadData])
 
-  const handlePractice = async (topicId: string) => {
+  const handlePractice = async (topicId: string, includeToday = false) => {
     setPracticeBusy(topicId)
     setError('')
     try {
-      onPaperReady(await generateReviewPractice(topicId))
+      onPaperReady(await generateReviewPractice(topicId, includeToday))
     } catch (practiceError) {
       setError(practiceError instanceof Error ? practiceError.message : '复盘练习组卷失败。')
     } finally {
@@ -206,13 +235,19 @@ export function WrongReviewPage({
 
   const filteredRecords = useMemo(() => {
     const text = keyword.trim().toLowerCase()
-    return records.filter((item) => {
-      if (statusFilter !== 'all' && item.status !== statusFilter) return false
-      if (!text) return true
-      return [item.topic, item.stem, item.source_title, item.correct_answer_text]
-        .filter((value): value is string => Boolean(value))
-        .some((value) => value.toLowerCase().includes(text))
-    })
+    return records
+      .filter((item) => {
+        if (statusFilter !== 'all' && item.status !== statusFilter) return false
+        if (!text) return true
+        return [item.topic, item.stem, item.source_title, item.correct_answer_text]
+          .filter((value): value is string => Boolean(value))
+          .some((value) => value.toLowerCase().includes(text))
+      })
+      .sort(
+        (left, right) =>
+          (right.updated_at ?? 0) - (left.updated_at ?? 0) ||
+          (right.created_at ?? 0) - (left.created_at ?? 0),
+      )
   }, [keyword, records, statusFilter])
 
   const moduleStats = progress?.module_stats ?? []
@@ -220,6 +255,24 @@ export function WrongReviewPage({
   const moduleTopics = (progress?.topics ?? []).filter(
     (item) => moduleLabel(item.module || '综合测试能力') === activeModule,
   )
+  const priorityTopics = activeModule
+    ? moduleTopics
+        .filter(
+          (topic) =>
+            topic.total < 4 ||
+            topic.accuracy < 0.85 ||
+            topic.streak < 2 ||
+            !topic.cross_type_verified,
+        )
+        .slice()
+        .sort(
+          (left, right) =>
+            topicPriorityScore(left) - topicPriorityScore(right) ||
+            (right.updated_at ?? 0) - (left.updated_at ?? 0) ||
+            right.total - left.total,
+        )
+        .slice(0, 8)
+    : []
   return (
     <div className="space-y-5">
       <section className="tool-card">
@@ -238,6 +291,11 @@ export function WrongReviewPage({
               <span className="rounded-lg bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-700">
                 今日待复盘 {dashboard.due_count} · 待巩固 {dashboard.active_count} ·
                 已毕业 {dashboard.graduated_count}
+              </span>
+            )}
+            {dashboard && (dashboard.today_new_count ?? 0) > 0 && (
+              <span className="rounded-lg bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800">
+                今日新错 {dashboard.today_new_count}
               </span>
             )}
             {dashboard && (
@@ -314,10 +372,111 @@ export function WrongReviewPage({
 
       {!loading && tab === 'today' && (
         <section className="space-y-4">
-          {dashboard && dashboard.tasks.length === 0 && (
+          {dashboard && (dashboard.today_tasks?.length ?? 0) > 0 && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-sm font-semibold text-zinc-900">今日新错动态</p>
+                <span className="text-xs text-zinc-500">
+                  今天新答错的知识点，可先即时巩固，明天再进入间隔复习
+                </span>
+              </div>
+              {dashboard.today_tasks!.map((task) => {
+                const expansionKey = `today:${task.topic_id}`
+                const open = expandedTask === expansionKey
+                return (
+                  <section key={expansionKey} className="tool-card border-amber-200 bg-amber-50/40">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-zinc-900">{task.topic}</p>
+                        <p className="mt-1 text-xs text-zinc-500">
+                          今日新错 {task.due_count} 道 · 明日进入 1 天 / 3 天 / 7 天 / 15 天间隔
+                        </p>
+                        {task.source_docs && task.source_docs.length > 0 && (
+                          <p className="mt-1 truncate text-xs text-zinc-500">
+                            来源：《{task.source_docs[0]}》
+                            {task.source_docs.length > 1 ? ` 等 ${task.source_docs.length} 份` : ''}
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          className="primary-btn px-3 py-2 text-xs"
+                          onClick={() => void handlePractice(task.topic_id, true)}
+                          disabled={practiceBusy === task.topic_id}
+                        >
+                          {practiceBusy === task.topic_id ? (
+                            <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                          ) : (
+                            <RotateCcw className="size-3.5" aria-hidden="true" />
+                          )}
+                          马上练 5 题
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-btn px-3 py-2 text-xs"
+                          onClick={() => setExpandedTask(open ? '' : expansionKey)}
+                          aria-expanded={open}
+                        >
+                          {open ? (
+                            <ChevronDown className="size-3.5" aria-hidden="true" />
+                          ) : (
+                            <ChevronRight className="size-3.5" aria-hidden="true" />
+                          )}
+                          展开
+                        </button>
+                      </div>
+                    </div>
+                    {open && (
+                      <ul className="mt-4 space-y-3">
+                        {task.records.map((record) => (
+                          <li key={record.review_id} className="rounded-lg border border-amber-200 bg-white p-3.5">
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                              <span className="rounded-md bg-white px-2 py-0.5 font-medium text-zinc-600 ring-1 ring-zinc-200">
+                                {TYPE_LABEL[record.type] ?? record.type}
+                              </span>
+                              <span className="text-zinc-500">错 {record.wrong_count} 次</span>
+                            </div>
+                            <p className="mt-2 text-sm leading-6 text-zinc-800">{record.stem}</p>
+                            <p className="mt-2 text-sm leading-6 text-emerald-800">
+                              正确答案：{record.correct_answer_text}
+                            </p>
+                            {record.explanation && (
+                              <p className="mt-1.5 text-sm leading-6 text-zinc-600">{record.explanation}</p>
+                            )}
+                            <div className="mt-3 flex justify-end">
+                              <button
+                                type="button"
+                                className="inline-flex items-center gap-1 rounded-md bg-sky-600 px-2 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-700"
+                                onClick={() =>
+                                  onOpenExpression(
+                                    record.topic,
+                                    undefined,
+                                    recordDocIds(record),
+                                    'wrong_review',
+                                  )
+                                }
+                              >
+                                <Mic className="size-3" aria-hidden="true" />
+                                去说一说
+                              </button>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </section>
+                )
+              })}
+            </div>
+          )}
+          {dashboard && dashboard.tasks.length === 0 && (dashboard.today_tasks?.length ?? 0) === 0 && (
             <section className="tool-card text-sm text-zinc-500">
-              今天没有到期错题。继续保持每天练习，复盘会按 1 天 → 3 天 → 7 天 → 15 天自动排期。
+              今天没有到期错题，也没有新的错题动态。继续保持每天练习，复盘会按 1 天 → 3 天 → 7 天 → 15 天自动排期。
             </section>
+          )}
+          {dashboard && dashboard.tasks.length > 0 && (
+            <p className="text-sm font-semibold text-zinc-900">到期复习</p>
           )}
           {dashboard?.tasks.map((task) => {
             const open = expandedTask === task.topic_id
@@ -473,7 +632,6 @@ export function WrongReviewPage({
               })}
             </div>
           )}
-
           {activeModule && (
             <div className="mt-5">
               <p className="text-sm font-semibold text-zinc-900">{moduleLabel(activeModule)}</p>
@@ -502,21 +660,31 @@ export function WrongReviewPage({
             </div>
           )}
 
-          {(progress?.focus_topics ?? []).length > 0 && (
+          {activeModule && (
             <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 p-3.5">
               <p className="flex items-center gap-1.5 text-sm font-semibold text-amber-900">
                 <TrendingUp className="size-4" aria-hidden="true" />
-                优先巩固
+                优先巩固 · {moduleLabel(activeModule)}
               </p>
-              <ul className="mt-2 space-y-2">
-                {progress?.focus_topics.slice(0, 8).map((topic) => (
-                  <li key={topic.topic} className="text-sm leading-6 text-amber-900">
-                    <span className="font-medium">{topic.topic}</span>：{topic.recommended_action}
-                  </li>
-                ))}
-              </ul>
+              <p className="mt-1 text-xs leading-5 text-amber-800/80">
+                根据当前板块的样本量、正确率、题型覆盖和最近答题状态实时排序。
+              </p>
+              {priorityTopics.length === 0 ? (
+                <p className="mt-2 text-sm leading-6 text-amber-900">
+                  当前板块暂无明显薄弱点，保持间隔复习即可。
+                </p>
+              ) : (
+                <ul className="mt-2 space-y-2">
+                  {priorityTopics.map((topic) => (
+                    <li key={topic.topic} className="text-sm leading-6 text-amber-900">
+                      <span className="font-medium">{topic.topic}</span>：{priorityAdvice(topic)}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           )}
+
         </section>
       )}
 

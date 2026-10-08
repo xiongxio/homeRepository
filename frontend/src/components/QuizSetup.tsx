@@ -309,7 +309,7 @@ export function QuizSetup({
         <p className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-800">
           <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
           <span>
-            还没有知识库文档。先在右侧「测试知识库」导入你的面试错题本或面试纪要，再回到这里生成考题。
+            还没有知识库文档。先在右侧「本地知识库」导入你的面试错题本或面试纪要，再回到这里生成考题。
           </span>
         </p>
       </section>
@@ -690,7 +690,7 @@ export function QuizSetup({
         </div>
       )}
 
-      {error && mistakePanelOpen && (
+      {error && (
         <p className="mt-3 text-sm leading-5 text-red-600">{error}</p>
       )}
 

@@ -178,7 +178,7 @@ export function KnowledgeLibrary({
       <div className="flex items-center justify-between gap-3">
         <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-900">
           <BookOpen className="size-5 text-emerald-600" aria-hidden="true" />
-          测试知识库
+          本地知识库
         </h2>
         <span className="rounded-lg bg-zinc-100 px-2 py-1 text-xs font-medium text-zinc-500">
           {documents.length} 份

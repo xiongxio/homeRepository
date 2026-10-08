@@ -9,6 +9,7 @@ from ..schemas import (
     TopicExtractRequest,
 )
 from ..services import quiz as quiz_service
+from ..services.llm import LlmError
 
 router = APIRouter(prefix="/api/quiz", tags=["quiz"])
 
@@ -40,6 +41,9 @@ async def generate_paper(req: QuizGenerateRequest):
             req.direction_id,
             req.knowledge_point_ids,
         )
+    except LlmError as exc:
+        # LLM 上游问题（余额、鉴权、限流等）单独映射为 502，避免与请求体错误混淆。
+        raise HTTPException(502, str(exc))
     except quiz_service.QuizError as exc:
         raise HTTPException(422, str(exc))
     return quiz_service.get_paper(paper["paper_id"])
@@ -58,6 +62,8 @@ async def generate_mistake_paper(req: MistakeQuizRequest):
             req.topics,
             req.total,
         )
+    except LlmError as exc:
+        raise HTTPException(502, str(exc))
     except quiz_service.QuizError as exc:
         raise HTTPException(422, str(exc))
     return quiz_service.get_paper(paper["paper_id"])

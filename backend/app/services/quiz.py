@@ -253,6 +253,10 @@ def _topic_module(topic: str, catalog: dict) -> str:
         "知识库", "模型选型", "temperature", "listindex", "余弦相似度",
         "cosinesimilarity", "索引",
     )
+    ai_app_category_terms = (
+        "llm原理", "llm使用", "rag", "agent框架", "agent进阶",
+        "上下文管理", "工具设计", "工程化部署", "面试方法论",
+    )
     ai_terms = (
         "ai", "llm", "大模型", "rag", "agent", "智能体", "prompt", "embedding",
         "向量", "transformer", "token", "hallucination", "幻觉", "mcp",
@@ -282,6 +286,8 @@ def _topic_module(topic: str, catalog: dict) -> str:
     if any(term in source for term in ai_test_terms):
         return "AI 测试"
     if any(term in source for term in ai_app_terms):
+        return "AI 应用开发"
+    if any(term in category_key for term in ai_app_category_terms):
         return "AI 应用开发"
     if any(term in key for term in ai_terms):
         return "AI 应用开发"
@@ -971,6 +977,106 @@ def _request_quiz_raw_once(
     )
 
 
+# 默认 20 道题一次生成常会超过单批 max_tokens（特别是 MiniMax），
+# 这里包装一个“截断自动二分重试”：如果 LLM 返回 finish_reason=length，
+# 把该批题量减半重调一次；递归到进一步还截断就再减半。
+# 最终将多个子批的题目合并返回，并用前一批生成出来的题干
+# 作为后续批的 avoid_stems，避免重复出题。
+_HALVING_MAX_DEPTH = 3
+
+
+def _halve_counts(counts: dict[str, int]) -> tuple[dict[str, int], dict[str, int]]:
+    """把题量按类型二分。返回 (前半, 后半)。若部分类型仅 1 题，保留在前半以避免为零。"""
+    half: dict[str, int] = {}
+    rest: dict[str, int] = {}
+    for qtype, raw in counts.items():
+        n = max(0, int(raw))
+        if n <= 1:
+            half[qtype] = n
+            rest[qtype] = 0
+        else:
+            half[qtype] = n // 2
+            rest[qtype] = n - half[qtype]
+    return half, rest
+
+
+def _can_halve(counts: dict[str, int]) -> bool:
+    """判断该批题是否还有可分割余地（除非所有题都是 0/1）。"""
+    return any(int(v) > 1 for v in counts.values())
+
+
+def _merge_quiz_results(*parts: dict | None) -> dict:
+    """合并多个批次返回的 {'title', 'questions'} 结果。"""
+    merged = {"title": "", "questions": []}
+    for part in parts:
+        if not part:
+            continue
+        if part.get("title") and not merged["title"]:
+            merged["title"] = str(part["title"])
+        merged["questions"].extend(part.get("questions") or [])
+    return merged
+
+
+def _request_quiz_raw_halved(
+    material: str,
+    keywords: list[str],
+    counts: dict[str, int],
+    difficulty: str,
+    avoid_stems: list[str],
+    weak_topics: list[str],
+    coverage_hint: list[str],
+    extra_avoid_stems: list[str] | None = None,
+    depth: int = 0,
+) -> dict:
+    """在 _request_quiz_raw_once 之外包一层“截断 -> 二分 -> 重试 -> 合并”。"""
+    extra = list(extra_avoid_stems or [])
+    try:
+        return _request_quiz_raw_once(
+            material,
+            keywords,
+            counts,
+            difficulty,
+            list(avoid_stems) + extra,
+            weak_topics,
+            coverage_hint,
+        )
+    except llm_service.LlmEmptyResponseError:
+        # 上游返回了空内容，二分也救不了，直接上传让路由层提示用户切模型。
+        raise
+    except llm_service.LlmLengthError:
+        if depth >= _HALVING_MAX_DEPTH or not _can_halve(counts):
+            raise
+        half, rest = _halve_counts(counts)
+        if not _can_halve(half) and not _can_halve(rest):
+            raise
+        first = _request_quiz_raw_halved(
+            material,
+            keywords,
+            half,
+            difficulty,
+            avoid_stems,
+            weak_topics,
+            coverage_hint,
+            extra_avoid_stems=extra,
+            depth=depth + 1,
+        )
+        first_stems = [str(q.get("stem") or "") for q in first.get("questions") or []]
+        if any(int(v) > 0 for v in rest.values()):
+            second = _request_quiz_raw_halved(
+                material,
+                keywords,
+                rest,
+                difficulty,
+                avoid_stems,
+                weak_topics,
+                coverage_hint,
+                extra_avoid_stems=extra + first_stems,
+                depth=depth + 1,
+            )
+            return _merge_quiz_results(first, second)
+        return first
+
+
 def _request_quiz_raw_batched(
     material: str,
     keywords: list[str],
@@ -982,7 +1088,7 @@ def _request_quiz_raw_batched(
 ) -> dict:
     batches = _quiz_count_batches(counts)
     if len(batches) == 1:
-        return _request_quiz_raw_once(
+        return _request_quiz_raw_halved(
             material,
             keywords,
             batches[0],
@@ -995,7 +1101,7 @@ def _request_quiz_raw_batched(
     parts: list[dict | None] = [None] * len(batches)
 
     def request_batch(index: int, batch: dict[str, int]) -> tuple[int, dict]:
-        return index, _request_quiz_raw_once(
+        return index, _request_quiz_raw_halved(
             material,
             keywords,
             batch,
@@ -1036,7 +1142,7 @@ def _request_quiz_raw(
     total = sum(max(0, int(counts.get(qtype, 0))) for qtype in VALID_TYPES)
     if total <= QUIZ_FAST_SINGLE_CALL_LIMIT:
         try:
-            return _request_quiz_raw_once(
+            return _request_quiz_raw_halved(
                 material,
                 keywords,
                 counts,
@@ -1046,7 +1152,8 @@ def _request_quiz_raw(
                 coverage_hint,
             )
         except llm_service.LlmError as exc:
-            if "长度上限" not in str(exc):
+            if not isinstance(exc, llm_service.LlmLengthError):
+                # LlmLengthError 已经在 _request_quiz_raw_halved 里重试到底，这里别再重复处理。
                 raise
 
     return _request_quiz_raw_batched(
@@ -1302,8 +1409,9 @@ def generate_paper(
         if mode == "weak_board":
             initial_candidates = [item for item in initial_candidates if belongs_to_weak_board(item)]
         unique_questions = _dedupe_questions(initial_candidates, recent_stems)
-    except llm_service.LlmError as exc:
-        raise QuizError(f"组卷失败：{exc}") from exc
+    except llm_service.LlmError:
+        # LLM 上游问题由路由层映射为 502，不再伪装成 422 请求体错误。
+        raise
 
     retry_candidates: list[dict] = []
     retry_error: llm_service.LlmError | None = None
@@ -1475,7 +1583,8 @@ def generate_paper(
             reject_summary,
         )
         if retry_error is not None:
-            raise QuizError(f"补充命题失败：{retry_error}") from retry_error
+            # LLM 兜底补题也走上游，让路由映射为 502，而不是 422。
+            raise retry_error
         raise QuizError("模型返回的有效题目不足，请稍后重试或更换关键词。")
 
     questions = []
@@ -2100,6 +2209,7 @@ def _topic_entry(topic: str, stat: dict, module: str = "") -> dict:
         "by_type": stat.get("by_type", {}),
         "verified_types": verified_types,
         "cross_type_verified": len(verified_types) >= 2,
+        "updated_at": int(stat.get("updated_at") or 0),
     }
 
 
