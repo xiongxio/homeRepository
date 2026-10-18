@@ -423,11 +423,18 @@ export async function deleteResume(resumeId: string): Promise<void> {
 export async function extractQuizTopics(
   docIds: string[] = [],
   refresh = false,
+  allowFullScan = false,
+  signal?: AbortSignal,
 ): Promise<QuizTopic[]> {
   const data = await apiFetch<{ topics: QuizTopic[] }>('/quiz/topics', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ doc_ids: docIds, refresh }),
+    signal,
+    body: JSON.stringify({
+      doc_ids: docIds,
+      refresh,
+      allow_full_scan: allowFullScan,
+    }),
   })
   return data.topics ?? []
 }

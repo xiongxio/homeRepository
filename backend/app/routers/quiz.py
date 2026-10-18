@@ -18,7 +18,10 @@ router = APIRouter(prefix="/api/quiz", tags=["quiz"])
 async def extract_topics(req: TopicExtractRequest):
     try:
         topics = await asyncio.to_thread(
-            quiz_service.extract_topics, req.doc_ids, req.refresh
+            quiz_service.extract_topics,
+            req.doc_ids,
+            req.refresh,
+            req.allow_full_scan,
         )
     except quiz_service.QuizError as exc:
         raise HTTPException(422, str(exc))

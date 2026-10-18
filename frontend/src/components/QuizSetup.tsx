@@ -65,6 +65,7 @@ export function QuizSetup({
   const [judge, setJudge] = useState(4)
   const [difficulty, setDifficulty] = useState('easy')
   const [loadingTopics, setLoadingTopics] = useState(false)
+  const [topicsNotice, setTopicsNotice] = useState('')
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const [mistakePanelOpen, setMistakePanelOpen] = useState(false)
@@ -75,6 +76,7 @@ export function QuizSetup({
   const [selectedMistakeTopics, setSelectedMistakeTopics] = useState<string[]>([])
   const [mistakeTotal, setMistakeTotal] = useState(20)
   const topicsRequestRef = useRef(0)
+  const topicsAbortRef = useRef<AbortController | null>(null)
   const mistakesRequestRef = useRef(0)
   const latestAttempt = progress?.recent_attempts?.[0] ?? null
   const currentMistakeCount = latestAttempt
@@ -86,18 +88,32 @@ export function QuizSetup({
     // 提炼关键词要走一次 LLM，耗时不稳定。切换资料时旧请求可能还没回来，
     // 若不加序号，慢的旧响应会在新响应之后落地，把关键词覆盖回上一个资料。
     const request = ++topicsRequestRef.current
+    topicsAbortRef.current?.abort()
+    const controller = new AbortController()
+    topicsAbortRef.current = controller
     setLoadingTopics(true)
     setError('')
+    setTopicsNotice('')
     try {
-      const next = await extractQuizTopics(docIds, refresh)
+      const next = await extractQuizTopics(
+        docIds,
+        refresh,
+        refresh || docIds.length > 0,
+        controller.signal,
+      )
       if (request !== topicsRequestRef.current) return
       setTopics(next)
+      if (!refresh && docIds.length === 0 && next.length === 0) {
+        setTopicsNotice('请选择资料后提炼关键词；如需处理全部资料，请点击“重新提炼”。')
+      }
     } catch (loadError) {
       if (request !== topicsRequestRef.current) return
+      if (controller.signal.aborted) return
       setError(loadError instanceof Error ? loadError.message : '关键词提炼失败。')
     } finally {
       if (request === topicsRequestRef.current) {
         setLoadingTopics(false)
+        topicsAbortRef.current = null
       }
     }
   }
@@ -567,8 +583,17 @@ export function QuizSetup({
           <Loader2 className="size-4 animate-spin" aria-hidden="true" />
           正在从知识库提炼知识点
         </p>
+      ) : showNormalQuizSetup && topicsNotice ? (
+        <p className="mt-4 text-sm leading-5 text-zinc-500">{topicsNotice}</p>
       ) : showNormalQuizSetup ? (
-        <div className="mt-3 max-h-72 space-y-4 overflow-y-auto rounded-lg border border-zinc-200 bg-zinc-50 p-3">
+        <>
+          {loadingTopics && topics.length > 0 && (
+            <p className="mt-3 flex items-center gap-2 text-xs text-zinc-500">
+              <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+              正在更新关键词，当前结果仍可使用
+            </p>
+          )}
+          <div className="mt-3 max-h-72 space-y-4 overflow-y-auto rounded-lg border border-zinc-200 bg-zinc-50 p-3">
           {grouped.length === 0 && (
             <p className="text-sm text-zinc-500">没有匹配的关键词。</p>
           )}
@@ -611,7 +636,8 @@ export function QuizSetup({
               </div>
             )
           })}
-        </div>
+          </div>
+        </>
       ) : null}
 
       {showNormalQuizSetup && (

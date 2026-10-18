@@ -90,6 +90,7 @@ class ResumeProfileUpdate(BaseModel):
 class TopicExtractRequest(BaseModel):
     doc_ids: list[str] = Field(default_factory=list)
     refresh: bool = False
+    allow_full_scan: bool = False
 
 
 class QuizGenerateRequest(BaseModel):

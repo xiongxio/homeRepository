@@ -10,6 +10,7 @@ import shutil
 import time
 import uuid
 import unicodedata
+from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -59,6 +60,14 @@ if not quiz_logger.handlers:
     _quiz_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     quiz_logger.addHandler(_quiz_handler)
     quiz_logger.setLevel(logging.INFO)
+
+_TOPIC_EXTRACTION_LOCKS: dict[str, Lock] = {}
+_TOPIC_EXTRACTION_LOCKS_GUARD = Lock()
+
+
+def _topic_extraction_lock(cache_key: str) -> Lock:
+    with _TOPIC_EXTRACTION_LOCKS_GUARD:
+        return _TOPIC_EXTRACTION_LOCKS.setdefault(cache_key, Lock())
 
 
 def _minimax_provider() -> bool:
@@ -773,11 +782,34 @@ def _clean_explanation(text: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def extract_topics(doc_ids: list[str] | None = None, refresh: bool = False) -> list[dict]:
+def extract_topics(
+    doc_ids: list[str] | None = None,
+    refresh: bool = False,
+    allow_full_scan: bool = False,
+) -> list[dict]:
     """从知识库文档中提炼可勾选的知识点关键词，结果带缓存。"""
+    started_at = time.perf_counter()
     doc_ids = doc_ids or []
-    cache = _read_json(TOPICS_FILE, {})
     cache_key = ",".join(sorted(doc_ids)) or "__all__"
+    lock = _topic_extraction_lock(cache_key)
+    with lock:
+        return _extract_topics_locked(
+            doc_ids,
+            refresh,
+            allow_full_scan,
+            cache_key,
+            started_at,
+        )
+
+
+def _extract_topics_locked(
+    doc_ids: list[str],
+    refresh: bool,
+    allow_full_scan: bool,
+    cache_key: str,
+    started_at: float,
+) -> list[dict]:
+    cache = _read_json(TOPICS_FILE, {})
     documents = knowledge_service.list_documents()
     if doc_ids:
         documents = [doc for doc in documents if doc["doc_id"] in set(doc_ids)]
@@ -787,14 +819,24 @@ def extract_topics(doc_ids: list[str] | None = None, refresh: bool = False) -> l
     signature = "|".join(f"{doc['doc_id']}:{doc['char_count']}" for doc in documents)
     cached = cache.get(cache_key)
     if cached and cached.get("signature") == signature and not refresh:
+        quiz_logger.info(
+            "topics cache_hit scope=%s docs=%d elapsed=%.2fs",
+            cache_key,
+            len(documents),
+            time.perf_counter() - started_at,
+        )
         return cached.get("topics") or []
+    if not doc_ids and not allow_full_scan:
+        # 自动加载时不触发全库 LLM 提炼，避免打开组卷页就长时间等待。
+        # 用户主动点击“重新提炼”时由调用方显式允许全库扫描。
+        return []
 
     # 全库标引不需要读完整正文。均摊预算能避免第一份长文档占满输入，
     # 同时把所有文档的标题和开头片段都交给模型，关键词覆盖更均衡。
     material_parts: list[str] = []
     keyword_budget = MAX_KEYWORD_MATERIAL_CHARS
     per_doc_budget = max(400, keyword_budget // max(1, len(documents)))
-    keyword_started_at = time.perf_counter()
+    material_started_at = time.perf_counter()
     for doc in documents:
         if keyword_budget <= 0:
             break
@@ -806,11 +848,14 @@ def extract_topics(doc_ids: list[str] | None = None, refresh: bool = False) -> l
     material = "\n\n".join(material_parts)
     if not material.strip():
         raise QuizError("选中的文档没有可用正文。")
+    material_elapsed = time.perf_counter() - material_started_at
 
     try:
+        llm_started_at = time.perf_counter()
         raw = llm_service.chat_json(
             prompts.KEYWORD_SYSTEM, prompts.build_keyword_user(material)
         )
+        llm_elapsed = time.perf_counter() - llm_started_at
     except llm_service.LlmError as exc:
         raise QuizError(f"关键词提炼失败：{exc}") from exc
 
@@ -840,10 +885,13 @@ def extract_topics(doc_ids: list[str] | None = None, refresh: bool = False) -> l
     topics.sort(key=lambda item: item["weight"], reverse=True)
 
     quiz_logger.info(
-        "topics extracted docs=%d material_chars=%d elapsed=%.2fs",
+        "topics extracted scope=%s docs=%d material_chars=%d material_elapsed=%.2fs llm_elapsed=%.2fs elapsed=%.2fs",
+        cache_key,
         len(documents),
         MAX_KEYWORD_MATERIAL_CHARS - keyword_budget,
-        time.perf_counter() - keyword_started_at,
+        material_elapsed,
+        llm_elapsed,
+        time.perf_counter() - started_at,
     )
 
     cache[cache_key] = {"signature": signature, "topics": topics}
