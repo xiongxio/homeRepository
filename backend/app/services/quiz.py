@@ -39,7 +39,7 @@ TYPE_LABELS = {"single": "单选题", "multiple": "多选题", "judge": "判断�
 MAX_MATERIAL_CHARS = 24_000
 MAX_KEYWORD_MATERIAL_CHARS = 12_000
 MAX_REVIEW_SOURCE_CHARS = 2_400
-MAX_REVIEW_REFS_PER_TOPIC = 1
+MAX_REVIEW_REFS_PER_TOPIC = 3
 MAX_REVIEW_REF_CHARS = 400
 MAX_QUESTIONS = 30
 QUIZ_LLM_BATCH_SIZE = 8
@@ -261,10 +261,20 @@ def _topic_module(topic: str, catalog: dict) -> str:
         "top-k", "topk", "ann", "近似最近邻", "idf", "tf-idf", "tfidf",
         "知识库", "模型选型", "temperature", "listindex", "余弦相似度",
         "cosinesimilarity", "索引",
+        "意图识别", "意图理解", "入口判断", "任务规划", "任务分解",
+        "能力预筛", "能力展开", "能力调用", "工具调度", "agent调度",
+        "多agent", "子agent", "主agent", "工作流", "workflow", "状态机",
+        "query增强", "查询增强", "备料", "文件元信息预读", "元信息预读",
+        "渐进式加载", "needclarification", "澄清", "输出四件套", "任务清单",
+        "能力菜单", "调度", "sdd", "specs目录", "项目级skills", "个人skills",
+        "验收标准", "温度采样",
     )
     ai_app_category_terms = (
         "llm原理", "llm使用", "rag", "agent框架", "agent进阶",
-        "上下文管理", "工具设计", "工程化部署", "面试方法论",
+        "agent架构", "agent调度", "意图识别", "意图识别与调度", "任务规划",
+        "能力调度", "工作流", "上下文管理", "上下文工程", "工具设计",
+        "多智能体", "工程化部署", "面试方法论", "ai大模型", "ai研发流程",
+        "需求工程", "工程规范", "能力与技能", "记忆服务",
     )
     ai_terms = (
         "ai", "llm", "大模型", "rag", "agent", "智能体", "prompt", "embedding",
@@ -318,7 +328,7 @@ def _topic_module(topic: str, catalog: dict) -> str:
         return "传统软件测试"
     if any(term in source for term in software_terms):
         return "传统软件测试"
-    return "传统软件测试"
+    return "待分类"
 
 
 def _empty_type_stat() -> dict:
@@ -3164,7 +3174,7 @@ def grade(paper_id: str, answers: dict[str, list[str]]) -> dict:
         review = _build_local_review(graded, score, accuracy, review_sources, topic_stats)
         review["review_error"] = f"模型调用超时，已生成基础复习建议：{exc}"
 
-    review = _normalise_review(review, accuracy, review_sources)
+    review = _normalise_review(review, accuracy, review_sources, graded)
     review["learning_guide"] = _build_learning_guide(graded, paper, review_sources)
 
     attempt_id = uuid.uuid4().hex
@@ -3199,10 +3209,18 @@ def _normalise_review(
     review: dict,
     accuracy: float,
     review_sources: dict[str, list[dict]] | None = None,
+    graded: list[dict] | None = None,
 ) -> dict:
     level = str(review.get("mastery_level") or "").strip().lower()
     if level not in ("beginner", "developing", "proficient", "mastered"):
         level = _local_mastery_level(accuracy)
+
+    explanation_by_topic: dict[str, str] = {}
+    for graded_item in graded or []:
+        graded_topic = str(graded_item.get("topic") or "").strip()
+        explanation = str(graded_item.get("explanation") or "").strip()
+        if graded_topic and explanation and graded_topic not in explanation_by_topic:
+            explanation_by_topic[graded_topic] = explanation
 
     weak_topics = []
     for item in review.get("weak_topics") or []:
@@ -3217,21 +3235,34 @@ def _normalise_review(
             source_status = "reinforce" if source_refs else "missing"
         if not source_refs:
             source_status = "missing"
+        source_note = str(item.get("source_note") or "").strip()
+        diagnosis = str(item.get("diagnosis") or "").strip()
+        plain_summary = str(item.get("plain_summary") or "").strip()
+        study_points = [
+            str(v).strip() for v in (item.get("study_points") or []) if str(v).strip()
+        ]
+        if source_status == "missing":
+            # 证据不足时降低结论确定性，避免把模型补全内容伪装成原文结论。
+            source_note = source_note or "当前原文片段不足以完整证明这条解释，以下内容仅作待核对线索。"
+            if diagnosis:
+                diagnosis = f"基于当前题目和有限原文片段的初步判断：{diagnosis}"
+            if plain_summary:
+                plain_summary = f"当前片段只能确认部分信息，以下理解需要回到原文核对：{plain_summary}"
+            study_points = [f"待回到原文核对：{point}" for point in study_points]
         weak_topics.append(
             {
                 "topic": topic,
                 "module": _topic_module(topic, _topic_catalog()),
-                "diagnosis": str(item.get("diagnosis") or "").strip(),
-                "plain_summary": str(item.get("plain_summary") or "").strip(),
+                "question_explanation": explanation_by_topic.get(topic, ""),
+                "diagnosis": diagnosis,
+                "plain_summary": plain_summary,
                 "analogy": str(item.get("analogy") or "").strip(),
                 "flow_steps": [
                     str(v).strip() for v in (item.get("flow_steps") or []) if str(v).strip()
                 ],
                 "source_status": source_status,
-                "source_note": str(item.get("source_note") or "").strip(),
-                "study_points": [
-                    str(v).strip() for v in (item.get("study_points") or []) if str(v).strip()
-                ],
+                "source_note": source_note,
+                "study_points": study_points,
                 "next_actions": [
                     str(v).strip() for v in (item.get("next_actions") or []) if str(v).strip()
                 ],

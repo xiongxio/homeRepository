@@ -441,7 +441,9 @@ export function QuizResult({
                 </div>
                 {topic.diagnosis && (
                   <div className="mt-2.5 rounded-lg border border-amber-200 bg-amber-50 p-3">
-                    <p className="text-xs font-semibold text-amber-800">为什么做错</p>
+                    <p className="text-xs font-semibold text-amber-800">
+                      为什么做错 · {topic.source_status === 'missing' ? '基于有限证据的初步判断' : '复盘判断'}
+                    </p>
                     <p className="mt-1 text-sm leading-6 text-amber-900">{topic.diagnosis}</p>
                   </div>
                 )}
@@ -449,9 +451,15 @@ export function QuizResult({
                   <div className="mt-2.5 rounded-lg border border-emerald-100 bg-emerald-50 p-3">
                     <p className="flex items-center gap-1.5 text-xs font-semibold text-emerald-800">
                       <Lightbulb className="size-3.5" aria-hidden="true" />
-                      快速理解
+                      快速理解 · {topic.source_status === 'missing' ? '待原文核对' : '基于原文依据'}
                     </p>
                     <p className="mt-1 text-sm leading-6 text-emerald-900">{topic.plain_summary}</p>
+                  </div>
+                )}
+                {topic.question_explanation && (
+                  <div className="mt-2.5 rounded-lg border border-blue-100 bg-blue-50 p-3">
+                    <p className="text-xs font-semibold text-blue-800">出题原始解析 · 标准答案依据</p>
+                    <p className="mt-1 text-sm leading-6 text-blue-900">{topic.question_explanation}</p>
                   </div>
                 )}
                 {topic.analogy && (

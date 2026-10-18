@@ -419,7 +419,8 @@ def build_review_user(
             f"{index}. [{item.get('topic') or '未标注知识点'}]（{status}）\n"
             f"   题干：{item.get('stem', '')}\n"
             f"   你的答案：{item.get('user_answer_text') or '未作答'}\n"
-            f"   正确答案：{item.get('correct_answer_text', '')}"
+            f"   正确答案：{item.get('correct_answer_text', '')}\n"
+            f"   出题时原始解析：{item.get('explanation') or '未保存原始解析'}"
         )
     lines.append(
         "【逐题结果】\n"
@@ -441,6 +442,8 @@ def build_review_user(
             + "\n\n这些片段来自用户上传/导入的知识库，用于说明薄弱点在原文里的位置和不足。"
             "错因分析和补点建议都要优先引用这些片段：如果原文已讲到，指导用户回看并重新理解；"
             "如果原文不够，指出应该在原文档里补充或优化什么。不要编造原文，也不要凭空断言文档完全没有相关内容。"
+            "【证据边界】出题时原始解析是该题的标准解释；知识库片段只用于核对原文依据。"
+            "如果两者冲突，明确指出冲突，不要自行补全。"
         )
 
     return "\n\n".join(lines)

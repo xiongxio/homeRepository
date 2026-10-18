@@ -411,6 +411,7 @@ export interface GradedQuestion {
 export interface WeakTopic {
   topic: string
   module?: string
+  question_explanation?: string
   diagnosis: string
   plain_summary?: string
   analogy?: string
