@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "doc_title_rules": [
+    {
+      "match": "小白",
+      "domain": "AI 应用开发"
+    },
+    {
+      "match": "面试话术",
+      "domain": "AI 应用开发"
+    }
+  ],
+  "topic_overrides": {},
+  "confirmed_topics": {}
+}

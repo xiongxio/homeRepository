@@ -33,6 +33,8 @@ MISTAKES_FILE = QUIZ_DIR / "mistakes.json"
 MASTERY_FILE = QUIZ_DIR / "mastery.json"
 MASTERY_META_FILE = QUIZ_DIR / "mastery_meta.json"
 TOPICS_FILE = QUIZ_DIR / "topics.json"
+DOC_DOMAIN_RULES_FILE = QUIZ_DIR / "doc_domain_rules.json"
+BUILTIN_DOC_DOMAIN_RULES_FILE = Path(__file__).resolve().parents[1] / "quiz_domain_rules.json"
 
 VALID_TYPES = ("single", "multiple", "judge")
 TYPE_LABELS = {"single": "单选题", "multiple": "多选题", "judge": "判断题"}
@@ -63,6 +65,10 @@ if not quiz_logger.handlers:
 
 _TOPIC_EXTRACTION_LOCKS: dict[str, Lock] = {}
 _TOPIC_EXTRACTION_LOCKS_GUARD = Lock()
+_DOC_DOMAIN_RULES_CACHE: tuple[tuple[str, int, int], dict] | None = None
+_DOC_DOMAIN_RULES_CACHE_LOCK = Lock()
+_TOPIC_SOURCE_TITLES_CACHE: tuple[tuple[str, int, int, int], dict[str, set[str]]] | None = None
+_TOPIC_SOURCE_TITLES_CACHE_LOCK = Lock()
 
 
 def _topic_extraction_lock(cache_key: str) -> Lock:
@@ -240,12 +246,133 @@ def _canonical_topic(topic: str, catalog: dict | None = None) -> str:
     return catalog.get("display", {}).get(canonical, raw)
 
 
-def _topic_module(topic: str, catalog: dict) -> str:
+def _doc_domain_rules() -> dict:
+    """读取领域兜底规则；本地覆盖优先，其次使用仓库内置默认规则。"""
+    candidates = (DOC_DOMAIN_RULES_FILE, BUILTIN_DOC_DOMAIN_RULES_FILE)
+    selected = next((path for path in candidates if path.exists()), None)
+    if selected is None:
+        return {"doc_title_rules": [], "topic_overrides": {}, "confirmed_topics": {}}
+    try:
+        stat = selected.stat()
+    except OSError:
+        return {"doc_title_rules": [], "topic_overrides": {}, "confirmed_topics": {}}
+
+    cache_key = (str(selected), stat.st_mtime_ns, stat.st_size)
+    global _DOC_DOMAIN_RULES_CACHE
+    with _DOC_DOMAIN_RULES_CACHE_LOCK:
+        if _DOC_DOMAIN_RULES_CACHE and _DOC_DOMAIN_RULES_CACHE[0] == cache_key:
+            return _DOC_DOMAIN_RULES_CACHE[1]
+        raw = _read_json(selected, {})
+        rules = {
+            "doc_title_rules": [
+                item
+                for item in (raw.get("doc_title_rules") or [])
+                if isinstance(item, dict)
+            ]
+            if isinstance(raw, dict)
+            else [],
+            "topic_overrides": raw.get("topic_overrides") or {}
+            if isinstance(raw, dict)
+            else {},
+            "confirmed_topics": raw.get("confirmed_topics") or {}
+            if isinstance(raw, dict)
+            else {},
+        }
+        _DOC_DOMAIN_RULES_CACHE = (cache_key, rules)
+        return rules
+
+
+def _topic_source_titles() -> dict[str, set[str]]:
+    """建立“知识点 -> 来源文档标题”索引，供展示层做无侵入兜底分类。"""
+    if not PAPERS_DIR.exists():
+        return {}
+    paths = sorted(PAPERS_DIR.glob("*.json"))
+    try:
+        stats = [path.stat() for path in paths]
+    except OSError:
+        stats = []
+    cache_key = (
+        str(PAPERS_DIR),
+        len(stats),
+        max((stat.st_mtime_ns for stat in stats), default=0),
+        sum(stat.st_size for stat in stats),
+    )
+
+    global _TOPIC_SOURCE_TITLES_CACHE
+    with _TOPIC_SOURCE_TITLES_CACHE_LOCK:
+        if _TOPIC_SOURCE_TITLES_CACHE and _TOPIC_SOURCE_TITLES_CACHE[0] == cache_key:
+            return _TOPIC_SOURCE_TITLES_CACHE[1]
+
+        index: dict[str, set[str]] = {}
+        for path in paths:
+            paper = _read_json(path, None)
+            if not isinstance(paper, dict):
+                continue
+            paper_titles = [
+                str(title).strip()
+                for title in paper.get("doc_titles") or []
+                if str(title or "").strip()
+            ]
+            for question in paper.get("questions") or []:
+                if not isinstance(question, dict):
+                    continue
+                topic = str(question.get("topic") or "").strip()
+                if not topic:
+                    continue
+                titles = [
+                    str(title).strip()
+                    for title in (
+                        [question.get("source_title")]
+                        + [
+                            item.get("title")
+                            for item in question.get("source_docs") or []
+                            if isinstance(item, dict)
+                        ]
+                    )
+                    if str(title or "").strip()
+                ]
+                if not titles:
+                    titles = paper_titles
+                if not titles:
+                    continue
+                index.setdefault(_normalise_topic_key(topic), set()).update(titles)
+
+        _TOPIC_SOURCE_TITLES_CACHE = (cache_key, index)
+        return index
+
+
+def _source_titles_for_topic(
+    topic: str,
+    catalog: dict,
+    source_title_index: dict[str, set[str]] | None = None,
+) -> set[str]:
+    index = source_title_index if source_title_index is not None else _topic_source_titles()
+    key = _normalise_topic_key(topic)
+    canonical = catalog.get("aliases", {}).get(key, key)
+    titles: set[str] = set()
+    for candidate in (key, canonical):
+        if candidate:
+            titles.update(index.get(candidate, set()))
+    return titles
+
+
+def _topic_module(
+    topic: str,
+    catalog: dict,
+    source_titles: set[str] | None = None,
+) -> str:
     key = _normalise_topic_key(topic)
     canonical = catalog.get("aliases", {}).get(key, key)
     raw_category = catalog.get("categories", {}).get(canonical, "")
     category_key = _normalise_topic_key(raw_category)
     source = f"{category_key} {key}"
+    rules = _doc_domain_rules()
+    confirmed_topics = rules.get("confirmed_topics") or {}
+    if isinstance(confirmed_topics, dict):
+        for candidate in (key, canonical):
+            domain = str(confirmed_topics.get(candidate) or "").strip()
+            if domain:
+                return domain
 
     ai_test_terms = (
         "aitest", "ai测试", "ai代码审计", "ai缺陷", "ai辅助用例", "ai用例",
@@ -268,6 +395,18 @@ def _topic_module(topic: str, catalog: dict) -> str:
         "渐进式加载", "needclarification", "澄清", "输出四件套", "任务清单",
         "能力菜单", "调度", "sdd", "specs目录", "项目级skills", "个人skills",
         "验收标准", "温度采样",
+    )
+    # WorkBuddy / CodeBuddy / QClaw 产品专题关键词。这类词本身不带
+    # "ai"/"agent" 字样，但知识点内容全部属于 AI 应用开发方向。
+    ai_app_product_terms = (
+        "codebuddy", "workbuddy", "qclaw",
+        "工具抽象", "数据互通", "操作串联",
+        "技能专家灵感三级能力",
+        "本地文件5层防护", "本地文件安全防护",
+        "沙箱目录限制", "沙箱目录控制", "沙箱限制",
+        "数据上云策略", "数据能不上云就不上云",
+        "操作日志与回滚", "操作日志可回滚", "改文件备份回滚流程",
+        "人工审批", "高风险操作人工确认",
     )
     ai_app_category_terms = (
         "llm原理", "llm使用", "rag", "agent框架", "agent进阶",
@@ -302,6 +441,8 @@ def _topic_module(topic: str, catalog: dict) -> str:
         return "AI 测试"
     if any(term in key for term in ai_app_terms):
         return "AI 应用开发"
+    if any(term in key for term in ai_app_product_terms):
+        return "AI 应用开发"
     if any(term in source for term in ai_test_terms):
         return "AI 测试"
     if any(term in source for term in ai_app_terms):
@@ -328,6 +469,28 @@ def _topic_module(topic: str, catalog: dict) -> str:
         return "传统软件测试"
     if any(term in source for term in software_terms):
         return "传统软件测试"
+
+    # 仅影响原本会落到“待分类”的知识点：优先使用来源文档标题规则，
+    # 没有来源文档时才使用词级覆盖。已有明确判定绝不在这里被改写。
+    if source_titles is None:
+        return "待分类"
+    if source_titles:
+        for title in source_titles:
+            title_key = _normalise_topic_key(title)
+            if not title_key:
+                continue
+            for rule in rules.get("doc_title_rules") or []:
+                match = _normalise_topic_key(str(rule.get("match") or ""))
+                domain = str(rule.get("domain") or "").strip()
+                if match and domain and match in title_key:
+                    return domain
+    else:
+        overrides = rules.get("topic_overrides") or {}
+        if isinstance(overrides, dict):
+            for candidate in (key, canonical):
+                domain = str(overrides.get(candidate) or "").strip()
+                if domain:
+                    return domain
     return "待分类"
 
 
@@ -2199,9 +2362,19 @@ def _decorate_focus_entry(
     return entry
 
 
-def _current_focus_entry(topic: str, items: list[dict], catalog: dict | None = None) -> dict:
+def _current_focus_entry(
+    topic: str,
+    items: list[dict],
+    catalog: dict | None = None,
+    source_title_index: dict[str, set[str]] | None = None,
+) -> dict:
     """错题变形卷提交后，只按本卷表现生成重点复习项。"""
-    module = _topic_module(topic, catalog or _topic_catalog())
+    catalog = catalog or _topic_catalog()
+    module = _topic_module(
+        topic,
+        catalog,
+        _source_titles_for_topic(topic, catalog, source_title_index),
+    )
     by_type = {qtype: {"total": 0, "correct": 0} for qtype in VALID_TYPES}
     wrong_types: list[str] = []
     total = 0
@@ -2305,13 +2478,18 @@ def _module_stats(
     mastery: dict,
     catalog: dict,
     active_mistake_topics: set[str] | None = None,
+    source_title_index: dict[str, set[str]] | None = None,
 ) -> list[dict]:
     groups: dict[str, list[dict]] = {}
     active_mistake_topics = active_mistake_topics or set()
     for topic, stat in mastery.items():
         if int(stat.get("total", 0)) <= 0:
             continue
-        module = _topic_module(topic, catalog)
+        module = _topic_module(
+            topic,
+            catalog,
+            _source_titles_for_topic(topic, catalog, source_title_index),
+        )
         entry = _topic_entry(topic, stat, module)
         groups.setdefault(module, []).append(entry)
 
@@ -2376,8 +2554,14 @@ def _focus_entry(
     wrong_topics: set[str],
     active_mistake_topics: set[str],
     catalog: dict | None = None,
+    source_title_index: dict[str, set[str]] | None = None,
 ) -> dict | None:
-    module = _topic_module(topic, catalog or _topic_catalog())
+    catalog = catalog or _topic_catalog()
+    module = _topic_module(
+        topic,
+        catalog,
+        _source_titles_for_topic(topic, catalog, source_title_index),
+    )
     entry = _topic_entry(topic, stat, module)
     reasons: list[str] = []
     if topic in wrong_topics:
@@ -2457,6 +2641,7 @@ def _build_learning_guide(
     )
     mastery = _ensure_mastery_schema()
     catalog = _topic_catalog()
+    source_title_index = _topic_source_titles()
     mistakes = list_mistakes(limit=10_000)
     active_mistake_topics = {str(item.get("topic") or "未分类") for item in mistakes}
     wrong_topics = {
@@ -2466,7 +2651,11 @@ def _build_learning_guide(
     }
     current_topics = list(dict.fromkeys(str(item.get("topic") or "未分类") for item in graded))
     current_modules = {
-        _topic_module(topic, catalog)
+        _topic_module(
+            topic,
+            catalog,
+            _source_titles_for_topic(topic, catalog, source_title_index),
+        )
         for topic in current_topics
         if topic
     }
@@ -2476,7 +2665,12 @@ def _build_learning_guide(
         for item in graded:
             items_by_topic.setdefault(str(item.get("topic") or "未分类"), []).append(item)
         focus_topics = [
-            _current_focus_entry(topic, items_by_topic[topic], catalog)
+            _current_focus_entry(
+                topic,
+                items_by_topic[topic],
+                catalog,
+                source_title_index,
+            )
             for topic in current_topics
             if topic in wrong_topics and topic in items_by_topic
         ]
@@ -2501,7 +2695,12 @@ def _build_learning_guide(
         suggestion_topics = focus_topics
         if not suggestion_topics:
             suggestion_topics = [
-                _current_focus_entry(topic, items_by_topic[topic], catalog)
+                _current_focus_entry(
+                    topic,
+                    items_by_topic[topic],
+                    catalog,
+                    source_title_index,
+                )
                 for topic in current_topics
                 if topic in items_by_topic
             ]
@@ -2509,9 +2708,22 @@ def _build_learning_guide(
         if not wrong_topics:
             next_paper["reason"] = "本卷变形题已全部答对，下一套建议围绕本卷知识点做间隔复习。"
 
-        module_stats = _module_stats(mastery, catalog, active_mistake_topics)
+        module_stats = _module_stats(
+            mastery,
+            catalog,
+            active_mistake_topics,
+            source_title_index,
+        )
         all_entries = [
-            _topic_entry(topic, stat, _topic_module(topic, catalog))
+            _topic_entry(
+                topic,
+                stat,
+                _topic_module(
+                    topic,
+                    catalog,
+                    _source_titles_for_topic(topic, catalog, source_title_index),
+                ),
+            )
             for topic, stat in mastery.items()
         ]
         mastered_topics = [entry for entry in all_entries if _is_mastered_topic(entry)]
@@ -2550,7 +2762,15 @@ def _build_learning_guide(
         }
 
     all_entries = [
-        _topic_entry(topic, stat, _topic_module(topic, catalog))
+        _topic_entry(
+            topic,
+            stat,
+            _topic_module(
+                topic,
+                catalog,
+                _source_titles_for_topic(topic, catalog, source_title_index),
+            ),
+        )
         for topic, stat in mastery.items()
     ]
     mastered_topics = [entry for entry in all_entries if _is_mastered_topic(entry)]
@@ -2565,7 +2785,14 @@ def _build_learning_guide(
         stat = mastery.get(topic)
         if not stat:
             continue
-        entry = _focus_entry(topic, stat, wrong_topics, active_mistake_topics, catalog)
+        entry = _focus_entry(
+            topic,
+            stat,
+            wrong_topics,
+            active_mistake_topics,
+            catalog,
+            source_title_index,
+        )
         if entry:
             focus_topics.append(
                 _decorate_focus_entry(
@@ -2584,7 +2811,12 @@ def _build_learning_guide(
     focus_topics = _filter_focus_by_current_topics(focus_topics, current_topics)
 
     type_stats = _aggregate_type_stats(mastery)
-    module_stats = _module_stats(mastery, catalog, active_mistake_topics)
+    module_stats = _module_stats(
+        mastery,
+        catalog,
+        active_mistake_topics,
+        source_title_index,
+    )
     next_paper = _next_paper_suggestion(focus_topics, type_stats)
     if not next_paper["keywords"] and mastered_topics:
         next_paper["keywords"] = [item["topic"] for item in mastered_topics[:6]]
@@ -3591,8 +3823,17 @@ def list_weak_topics(limit: int = 10, threshold: float = 0.8) -> list[dict]:
 def get_progress() -> dict:
     mastery = _ensure_mastery_schema()
     catalog = _topic_catalog()
+    source_title_index = _topic_source_titles()
     topics = [
-        _topic_entry(topic, stat, _topic_module(topic, catalog))
+        _topic_entry(
+            topic,
+            stat,
+            _topic_module(
+                topic,
+                catalog,
+                _source_titles_for_topic(topic, catalog, source_title_index),
+            ),
+        )
         for topic, stat in mastery.items()
         if stat.get("total", 0)
     ]
