@@ -375,6 +375,7 @@ export function ExpressionDrill({
   const [generatedKnowledgeSignature, setGeneratedKnowledgeSignature] = useState('')
   const [knowledgePool, setKnowledgePool] =
     useState<KnowledgePoolState>(EMPTY_KNOWLEDGE_POOL)
+  const [knowledgeGenerating, setKnowledgeGenerating] = useState(false)
   const [resumeRecord, setResumeRecord] = useState<ResumeRecord | null>(activeResume)
   const timerRef = useRef<number | null>(null)
   const seededTokenRef = useRef(seedToken)
@@ -392,6 +393,7 @@ export function ExpressionDrill({
   const shouldTranscribeRef = useRef(false)
   const answerRoundRef = useRef(0)
   const mistakeRefreshTimeoutRef = useRef<number | null>(null)
+  const knowledgeRefreshTimeoutRef = useRef<number | null>(null)
   const isRetrying = previousSessionId !== ''
   const reviewGroups = useMemo(() => buildReviewGroups(reviewRecords), [reviewRecords])
   const filteredReviewGroups = useMemo(() => {
@@ -514,6 +516,79 @@ export function ExpressionDrill({
     [],
   )
 
+  const scheduleKnowledgeRefresh = useCallback(
+    (
+      key: string,
+      hint: string,
+      source: ExpressionSourceContext,
+      round: number,
+      nonce: string,
+      deadline: number,
+    ) => {
+      if (source.sourceType !== 'knowledge') return
+      if (Date.now() > deadline) {
+        setKnowledgeGenerating(false)
+        setBusy('')
+        setError('生成表达题超时，请稍后重试或更换文档。')
+        return
+      }
+      if (knowledgeRefreshTimeoutRef.current) {
+        window.clearTimeout(knowledgeRefreshTimeoutRef.current)
+      }
+      knowledgeRefreshTimeoutRef.current = window.setTimeout(async () => {
+        knowledgeRefreshTimeoutRef.current = null
+        if (answerRoundRef.current !== round) return
+        try {
+          const refreshed = await getExpressionQuestion(
+            key,
+            hint,
+            source.docIds,
+            source.sourceTag,
+            source.sourceType,
+            source.sourceRef,
+            source.questionType,
+            nonce,
+          )
+          if (answerRoundRef.current !== round) return
+          if (refreshed.generation_pending) {
+            scheduleKnowledgeRefresh(
+              key,
+              hint,
+              source,
+              round,
+              nonce,
+              deadline,
+            )
+            return
+          }
+          setQuestion(refreshed)
+          setKnowledgePool({
+            questions: refreshed.pool_questions ?? [],
+            index: Math.max(0, (refreshed.pool_index ?? 1) - 1),
+            exhausted: Boolean(refreshed.pool_exhausted),
+            message: refreshed.pool_message ?? '',
+          })
+          setGeneratedKnowledgeSignature(
+            knowledgeSignature(source.docIds, source.questionType),
+          )
+          setKnowledgeGenerating(false)
+          setBusy('')
+          setError('')
+        } catch (refreshError) {
+          if (answerRoundRef.current !== round) return
+          setKnowledgeGenerating(false)
+          setBusy('')
+          setError(
+            refreshError instanceof Error
+              ? refreshError.message
+              : '生成表达题失败，请稍后重试。',
+          )
+        }
+      }, 1500)
+    },
+    [],
+  )
+
   const loadQuestion = useCallback(
     async (
       key: string,
@@ -523,18 +598,24 @@ export function ExpressionDrill({
     ) => {
       const activeSource = source ?? activeSourceRef.current
       answerRoundRef.current += 1
-      const round = answerRoundRef.current
       if (mistakeRefreshTimeoutRef.current) {
         window.clearTimeout(mistakeRefreshTimeoutRef.current)
         mistakeRefreshTimeoutRef.current = null
       }
+      if (knowledgeRefreshTimeoutRef.current) {
+        window.clearTimeout(knowledgeRefreshTimeoutRef.current)
+        knowledgeRefreshTimeoutRef.current = null
+      }
+      setKnowledgeGenerating(false)
       cancelActiveRecording()
+      const round = answerRoundRef.current
       setBusy('question')
       setError('')
       setSession(null)
       setTranscript('')
       setPreviousSessionId('')
       setRetryMissedPoints([])
+      let pendingKnowledge = false
       try {
         setTopicHint(hint)
         activeSourceRef.current = activeSource
@@ -548,7 +629,27 @@ export function ExpressionDrill({
           activeSource.questionType,
           nonce,
         )
+        if (
+          activeSource.sourceType === 'knowledge' &&
+          nextQuestion.generation_pending
+        ) {
+          pendingKnowledge = true
+          setQuestion(null)
+          setKnowledgeGenerating(true)
+          setError('')
+          setBusy('question')
+          scheduleKnowledgeRefresh(
+            key,
+            hint,
+            activeSource,
+            round,
+            nonce || nextQuestion.pending_token || '',
+            Date.now() + 180_000,
+          )
+          return
+        }
         setQuestion(nextQuestion)
+        setKnowledgeGenerating(false)
         if (activeSource.sourceType === 'knowledge') {
           setKnowledgePool({
             questions: nextQuestion.pool_questions ?? [],
@@ -566,18 +667,22 @@ export function ExpressionDrill({
           scheduleMistakeRefresh(key, hint, activeSource, round)
         }
       } catch (loadError) {
+        setKnowledgeGenerating(false)
         setError(loadError instanceof Error ? loadError.message : '取题失败。')
       } finally {
-        setBusy('')
+        if (!pendingKnowledge) setBusy('')
       }
     },
-    [cancelActiveRecording, scheduleMistakeRefresh],
+    [cancelActiveRecording, scheduleKnowledgeRefresh, scheduleMistakeRefresh],
   )
 
   useEffect(
     () => () => {
       if (mistakeRefreshTimeoutRef.current) {
         window.clearTimeout(mistakeRefreshTimeoutRef.current)
+      }
+      if (knowledgeRefreshTimeoutRef.current) {
+        window.clearTimeout(knowledgeRefreshTimeoutRef.current)
       }
     },
     [],
@@ -681,7 +786,14 @@ export function ExpressionDrill({
   }
 
   const changeSourceType = (next: ExpressionSourceType) => {
-    if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
+    if (
+      busy === 'record' ||
+      busy === 'transcribing' ||
+      busy === 'analyze' ||
+      busy === 'question'
+    ) {
+      return
+    }
     setSourceType(next)
     const nextReviewId = selectedReviewId
     if (next === 'mistake') setReviewPickerOpen(true)
@@ -732,7 +844,14 @@ export function ExpressionDrill({
   }
 
   const changeQuestionType = (next: ExpressionQuestionType | '') => {
-    if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
+    if (
+      busy === 'record' ||
+      busy === 'transcribing' ||
+      busy === 'analyze' ||
+      busy === 'question'
+    ) {
+      return
+    }
     const source = buildSourceContext({ questionType: next })
     setQuestionType(next)
     if (source.sourceType === 'knowledge') {
@@ -762,7 +881,14 @@ export function ExpressionDrill({
   }
 
   const toggleDocument = (docId: string) => {
-    if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
+    if (
+      busy === 'record' ||
+      busy === 'transcribing' ||
+      busy === 'analyze' ||
+      busy === 'question'
+    ) {
+      return
+    }
     const next = selectedDocIds.includes(docId)
       ? selectedDocIds.filter((item) => item !== docId)
       : [...selectedDocIds, docId]
@@ -797,7 +923,14 @@ export function ExpressionDrill({
   }
 
   const generateKnowledgeQuestion = () => {
-    if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
+    if (
+      busy === 'record' ||
+      busy === 'transcribing' ||
+      busy === 'analyze' ||
+      busy === 'question'
+    ) {
+      return
+    }
     if (selectedDocIds.length === 0) {
       setError('请先勾选至少一份知识库文档，再生成表达题。')
       return
@@ -1477,14 +1610,18 @@ export function ExpressionDrill({
                       }`
                     : `真题编号 ${question.label || '未编号'}`
                 : sourceType === 'knowledge'
-                  ? '勾选文档后点「生成 1 道表达题」开始'
+                  ? knowledgeGenerating
+                    ? '正在生成表达题'
+                    : '勾选文档后点「生成 1 道表达题」开始'
                   : '选好岗位后取一道真题开始'}
             </p>
             <p className="mt-1.5 text-[15px] font-medium leading-7 text-zinc-900">
               {question?.question ??
-                (sourceType === 'knowledge'
-                  ? '先在上方勾选知识库文档，再点「生成 1 道表达题」。'
-                  : '点击右侧按钮，从你的真实面试题库里抽一道表达练习题。')}
+                (knowledgeGenerating
+                  ? '正在从所选文档生成表达题，完成后会自动显示，不需要重复点击。'
+                  : sourceType === 'knowledge'
+                    ? '先在上方勾选知识库文档，再点「生成 1 道表达题」。'
+                    : '点击右侧按钮，从你的真实面试题库里抽一道表达练习题。')}
             </p>
             {question?.source && (
               <p className="mt-1 text-xs leading-5 text-zinc-500">
@@ -1566,6 +1703,19 @@ export function ExpressionDrill({
             </button>
           )}
         </div>
+
+        {knowledgeGenerating && sourceType === 'knowledge' && (
+          <div className="mt-3 flex items-start gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-800">
+            <Loader2
+              className="mt-0.5 size-3.5 shrink-0 animate-spin"
+              aria-hidden="true"
+            />
+            <span>
+              正在从所选文档生成表达题。当前模型较慢时可能需要 1–2
+              分钟，页面会自动等待，不需要重复点击。
+            </span>
+          </div>
+        )}
 
         {topicHint && (
           <p

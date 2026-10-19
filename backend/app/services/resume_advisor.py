@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 
 from ..config import settings
@@ -34,6 +36,13 @@ BANK_TITLE_HINTS = ("硬件面试题答疑", "薄弱题库")
 def _advice_path(resume_id: str):
     ADVICE_DIR.mkdir(parents=True, exist_ok=True)
     return ADVICE_DIR / f"{resume_id}.json"
+
+
+def _context_key(company: str, target_role: str, jd: str) -> str:
+    raw = "\n".join(
+        [company.strip(), target_role.strip(), jd.strip()]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 def _collect_bank_questions(limit: int = 90) -> list[dict]:
@@ -82,20 +91,28 @@ def _resume_facts(profile: dict) -> str:
     return "\n".join(lines)
 
 
-def generate_advice(resume_id: str = "", refresh: bool = False) -> dict:
+def generate_advice(
+    resume_id: str = "",
+    refresh: bool = False,
+    company: str = "",
+    target_role: str = "",
+    jd: str = "",
+) -> dict:
     record = resume_service.get_active_resume() if not resume_id else resume_service.get_resume(resume_id)
     if not record:
         raise AdvisorError("还没有简历档案，请先导入简历。")
     resume_id = record["resume_id"]
     profile = record.get("profile") or {}
+    context_key = _context_key(company, target_role, jd)
+    has_target = any(value.strip() for value in (company, target_role, jd))
 
     path = _advice_path(resume_id)
     if path.exists() and not refresh:
-        import json
-
         try:
             cached = json.loads(path.read_text(encoding="utf-8"))
-            if cached.get("char_count") == record.get("char_count"):
+            same_resume = cached.get("char_count") == record.get("char_count")
+            same_target = not has_target or cached.get("context_key") == context_key
+            if same_resume and same_target:
                 return cached
         except (json.JSONDecodeError, OSError):
             pass
@@ -113,6 +130,9 @@ def generate_advice(resume_id: str = "", refresh: bool = False) -> dict:
                 questions,
                 _section_frequency(questions),
                 weak_topics,
+                company=company,
+                target_role=target_role,
+                jd=jd,
             ),
         )
     except llm_service.LlmError as exc:
@@ -134,6 +154,7 @@ def generate_advice(resume_id: str = "", refresh: bool = False) -> dict:
                 "target": str(item.get("target") or "").strip(),
                 "issue": str(item.get("issue") or "").strip(),
                 "suggestion": suggestion,
+                "jd_requirement": str(item.get("jd_requirement") or "").strip(),
                 "example": str(item.get("example") or "").strip(),
                 "evidence": [str(e).strip() for e in (item.get("evidence") or []) if str(e).strip()][:4],
             }
@@ -150,10 +171,11 @@ def generate_advice(resume_id: str = "", refresh: bool = False) -> dict:
         "suggestions": suggestions,
         "question_count": len(questions),
         "weak_topic_count": len(weak_topics),
+        "context_key": context_key,
+        "company": company.strip(),
+        "target_role": target_role.strip(),
         "created_at": int(time.time()),
     }
-    import json
-
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
 
@@ -162,8 +184,6 @@ def load_advice(resume_id: str) -> dict | None:
     path = _advice_path(resume_id)
     if not path.exists():
         return None
-    import json
-
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):

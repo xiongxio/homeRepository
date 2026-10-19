@@ -225,6 +225,7 @@ export interface ResumeSummary {
 export interface ResumeAdviceSuggestion {
   priority: 'high' | 'medium' | 'low'
   target: string
+  jd_requirement?: string
   issue: string
   suggestion: string
   example: string
@@ -237,6 +238,9 @@ export interface ResumeAdvice {
   suggestions: ResumeAdviceSuggestion[]
   question_count: number
   weak_topic_count: number
+  context_key?: string
+  company?: string
+  target_role?: string
   created_at: number
 }
 
@@ -274,6 +278,8 @@ export interface ExpressionQuestion {
   group_topic?: string
   related_review_ids?: string[]
   generation_pending?: boolean
+  pending_token?: string
+  retry_after_ms?: number
   pool_index?: number
   pool_limit?: number
   pool_remaining?: number
@@ -693,9 +699,43 @@ export interface TopicProgress {
   updated_at?: number
 }
 
+export interface RecentWeakTopicSourceDoc {
+  doc_id: string
+  title: string
+  count: number
+}
+
+export interface RecentWeakTopic {
+  topic: string
+  total: number
+  correct: number
+  accuracy: number
+  wrong_count: number
+  streak: number
+  sample_state: 'verified' | 'tentative'
+  last_answered_at: number
+  by_type: Partial<
+    Record<QuestionType, { total: number; correct: number; accuracy: number }>
+  >
+  source_docs: RecentWeakTopicSourceDoc[]
+  source_count: number
+  diagnosis: string
+  diagnosis_at: number
+}
+
+export interface RecentWeakWindow {
+  days: number
+  start_at: number
+  attempts: number
+  answered: number
+  source_count: number
+}
+
 export interface QuizProgress {
   topics: TopicProgress[]
   recent_attempts: AttemptSummary[]
+  recent_weak_topics?: RecentWeakTopic[]
+  recent_window?: RecentWeakWindow
   mistake_count: number
   answered_total: number
   correct_total: number

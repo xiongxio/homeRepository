@@ -4,7 +4,12 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
-from ..schemas import ResumeFileRequest, ResumeProfileUpdate, ResumeTextRequest
+from ..schemas import (
+    ResumeAdviceRequest,
+    ResumeFileRequest,
+    ResumeProfileUpdate,
+    ResumeTextRequest,
+)
 from ..services import resume as resume_service
 from ..services import resume_advisor
 from .uploads import get_file_record
@@ -75,9 +80,17 @@ async def get_active():
 
 
 @router.post("/active/advice")
-async def generate_advice(refresh: bool = False):
+async def generate_advice(req: ResumeAdviceRequest | None = None, refresh: bool = False):
+    payload = req or ResumeAdviceRequest()
     try:
-        return await asyncio.to_thread(resume_advisor.generate_advice, "", refresh)
+        return await asyncio.to_thread(
+            resume_advisor.generate_advice,
+            "",
+            payload.refresh or refresh,
+            payload.company,
+            payload.target_role,
+            payload.jd,
+        )
     except resume_advisor.AdvisorError as exc:
         raise HTTPException(422, str(exc))
 

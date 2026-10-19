@@ -149,6 +149,78 @@ class ReviewApiSmokeTests(unittest.TestCase):
         self.assertEqual(0, retry.json()["retried"])
         self.assertEqual(0, retry.json()["pending_count"])
 
+    def test_practice_api_can_include_all_active_records(self):
+        fake_paper = {
+            "paper_id": "paper_api_active_review",
+            "title": "复盘练习",
+            "questions": [],
+            "generation_context": {
+                "kind": "review_practice",
+                "topic_id": "接口自动化",
+                "review_ids": [],
+                "include_active": True,
+            },
+        }
+        with (
+            patch.object(
+                review_service,
+                "generate_practice_paper",
+                return_value=fake_paper,
+            ) as fake_generate,
+            patch.object(
+                quiz_service,
+                "get_paper",
+                return_value=fake_paper,
+            ),
+        ):
+            practice = self.client.post(
+                "/api/quiz/review/tasks/%E6%8E%A5%E5%8F%A3%E8%87%AA%E5%8A%A8%E5%8C%96/practice"
+                "?include_active=true"
+            )
+
+        self.assertEqual(200, practice.status_code)
+        fake_generate.assert_called_once_with("接口自动化", 5, False, True)
+
+    def test_redo_api_binds_selected_group_records(self):
+        fake_paper = {
+            "paper_id": "paper_api_redo",
+            "title": "错题重做",
+            "questions": [
+                {"question_id": "q1"},
+                {"question_id": "q2"},
+            ],
+            "generation_context": {
+                "kind": "review_practice",
+                "topic_id": "接口自动化",
+                "review_ids": ["rv_1", "rv_2"],
+                "requested_total": 2,
+                "redo_mode": "original",
+            },
+        }
+        with (
+            patch.object(
+                review_service,
+                "generate_redo_paper",
+                return_value=fake_paper,
+            ) as fake_generate,
+            patch.object(
+                quiz_service,
+                "get_paper",
+                return_value=fake_paper,
+            ),
+        ):
+            redo = self.client.post(
+                "/api/quiz/review/tasks/%E6%8E%A5%E5%8F%A3%E8%87%AA%E5%8A%A8%E5%8C%96/redo",
+                json={"review_ids": ["rv_1", "rv_2"]},
+            )
+
+        self.assertEqual(200, redo.status_code)
+        self.assertEqual(2, len(redo.json()["questions"]))
+        fake_generate.assert_called_once_with(
+            "接口自动化",
+            ["rv_1", "rv_2"],
+        )
+
     def test_expression_question_api_merges_wrong_review_group(self):
         question = {
             "topic": "接口自动化",

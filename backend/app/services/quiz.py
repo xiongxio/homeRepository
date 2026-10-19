@@ -69,6 +69,8 @@ _DOC_DOMAIN_RULES_CACHE: tuple[tuple[str, int, int], dict] | None = None
 _DOC_DOMAIN_RULES_CACHE_LOCK = Lock()
 _TOPIC_SOURCE_TITLES_CACHE: tuple[tuple[str, int, int, int], dict[str, set[str]]] | None = None
 _TOPIC_SOURCE_TITLES_CACHE_LOCK = Lock()
+_RECENT_TOPIC_PROGRESS_CACHE: tuple[tuple, dict] | None = None
+_RECENT_TOPIC_PROGRESS_CACHE_LOCK = Lock()
 
 
 def _topic_extraction_lock(cache_key: str) -> Lock:
@@ -3820,6 +3822,311 @@ def list_weak_topics(limit: int = 10, threshold: float = 0.8) -> list[dict]:
     return items[:limit]
 
 
+_DIAGNOSIS_PREFIXES = (
+    "基于当前题目和有限原文片段的初步判断：",
+    "基于当前题目和有限原文片段的初步判断:",
+    "本次虽然答对，但",
+    "虽然本题选对了所有选项，但",
+)
+
+
+def _clean_topic_diagnosis(value) -> str:
+    """把交卷复盘里的诊断压成适合卡片展示的一行文本。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    for prefix in _DIAGNOSIS_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix) :].strip()
+            break
+    return text
+
+
+def _recent_progress_cache_key(days: int) -> tuple:
+    paths = list(ATTEMPTS_DIR.glob("*.json")) if ATTEMPTS_DIR.exists() else []
+    stats = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        stats.append((stat.st_mtime_ns, stat.st_size))
+    try:
+        topics_stat = TOPICS_FILE.stat()
+        topics_signature = (topics_stat.st_mtime_ns, topics_stat.st_size)
+    except OSError:
+        topics_signature = (0, 0)
+    return (
+        str(ATTEMPTS_DIR),
+        str(TOPICS_FILE),
+        days,
+        len(stats),
+        max((item[0] for item in stats), default=0),
+        sum(item[1] for item in stats),
+        topics_signature,
+    )
+
+
+def _question_source_doc(
+    question: dict,
+    paper: dict | None,
+    docs_by_id: dict[str, dict],
+    docs_by_title: dict[str, dict],
+) -> dict | None:
+    """按题目级来源优先、试卷级来源兜底的顺序解析单份主文档。"""
+    source_id = str(question.get("source_doc_id") or "").strip()
+    if source_id in docs_by_id:
+        return docs_by_id[source_id]
+
+    for source in question.get("source_docs") or []:
+        if not isinstance(source, dict):
+            continue
+        candidate_id = str(source.get("doc_id") or "").strip()
+        if candidate_id in docs_by_id:
+            return docs_by_id[candidate_id]
+        title = str(source.get("title") or "").strip()
+        if title:
+            known = docs_by_title.get(_title_key(title))
+            if known:
+                return known
+            return {"doc_id": candidate_id, "title": title}
+
+    referenced = _mistake_paper_docs(paper)
+    if len(referenced) == 1:
+        candidate = referenced[0]
+        candidate_id = str(candidate.get("doc_id") or "").strip()
+        if candidate_id in docs_by_id:
+            return docs_by_id[candidate_id]
+        title = str(candidate.get("title") or "").strip()
+        if title:
+            known = docs_by_title.get(_title_key(title))
+            if known:
+                return known
+            return {"doc_id": candidate_id, "title": title}
+
+    title = str(question.get("source_title") or "").strip()
+    if title:
+        known = docs_by_title.get(_title_key(title))
+        if known:
+            return known
+        return {"doc_id": source_id, "title": title}
+    return None
+
+
+def _reset_recent_topic_progress_cache() -> None:
+    global _RECENT_TOPIC_PROGRESS_CACHE
+    with _RECENT_TOPIC_PROGRESS_CACHE_LOCK:
+        _RECENT_TOPIC_PROGRESS_CACHE = None
+
+
+def get_recent_topic_progress(days: int = 7) -> dict:
+    """按交卷时间聚合近 N 天知识点表现，并复用交卷复盘中的诊断。
+
+    主榜只放样本 >= 3 且正确率 < 80% 的知识点；样本不足但已经答错的
+    知识点会以 tentative 状态补位，避免 0/2 这类小样本压过更可靠的薄弱项。
+    """
+    ensure_dirs()
+    days = max(1, int(days or 7))
+    cutoff = int(time.time()) - days * 86400
+    cache_key = _recent_progress_cache_key(days)
+
+    global _RECENT_TOPIC_PROGRESS_CACHE
+    with _RECENT_TOPIC_PROGRESS_CACHE_LOCK:
+        if _RECENT_TOPIC_PROGRESS_CACHE and _RECENT_TOPIC_PROGRESS_CACHE[0] == cache_key:
+            return _RECENT_TOPIC_PROGRESS_CACHE[1]
+
+    catalog = _topic_catalog()
+    docs = knowledge_service.list_documents()
+    docs_by_id = {
+        str(doc.get("doc_id")): doc
+        for doc in docs
+        if isinstance(doc, dict) and doc.get("doc_id")
+    }
+    docs_by_title = {
+        _title_key(str(doc.get("title") or "")): doc
+        for doc in docs_by_id.values()
+        if doc.get("title")
+    }
+
+    papers_by_id: dict[str, dict] = {}
+    papers_by_title: dict[str, dict] = {}
+    if PAPERS_DIR.exists():
+        for path in PAPERS_DIR.glob("*.json"):
+            paper = _read_json(path, None)
+            if not isinstance(paper, dict):
+                continue
+            if paper.get("paper_id"):
+                papers_by_id[str(paper["paper_id"])] = paper
+            if paper.get("title"):
+                papers_by_title.setdefault(_title_key(str(paper["title"])), paper)
+
+    def resolve_paper(attempt: dict) -> dict | None:
+        paper = papers_by_id.get(str(attempt.get("paper_id") or ""))
+        if paper:
+            return paper
+        paper_title = str(attempt.get("paper_title") or "").strip()
+        if paper_title:
+            return papers_by_title.get(_title_key(paper_title))
+        return None
+
+    attempts: list[tuple[int, dict]] = []
+    for path in ATTEMPTS_DIR.glob("*.json"):
+        attempt = _read_json(path, None)
+        if not isinstance(attempt, dict):
+            continue
+        try:
+            created_at = int(attempt.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0
+        if created_at < cutoff:
+            continue
+        attempts.append((created_at, attempt))
+    attempts.sort(key=lambda item: item[0])
+
+    aggregate: dict[str, dict] = {}
+    diagnoses: dict[str, dict] = {}
+    source_keys: set[str] = set()
+    answered = 0
+
+    for created_at, attempt in attempts:
+        paper = resolve_paper(attempt)
+        review = attempt.get("review") if isinstance(attempt.get("review"), dict) else {}
+        for weak in review.get("weak_topics") or []:
+            if not isinstance(weak, dict):
+                continue
+            topic = _canonical_topic(str(weak.get("topic") or "未分类"), catalog)
+            diagnosis = _clean_topic_diagnosis(weak.get("diagnosis"))
+            if not diagnosis:
+                continue
+            existing = diagnoses.get(topic)
+            if existing is None or created_at >= existing["at"]:
+                diagnoses[topic] = {"text": diagnosis, "at": created_at}
+
+        for question in attempt.get("questions") or []:
+            if not isinstance(question, dict):
+                continue
+            topic = _canonical_topic(str(question.get("topic") or "未分类"), catalog)
+            stat = aggregate.setdefault(
+                topic,
+                {
+                    "topic": topic,
+                    "total": 0,
+                    "correct": 0,
+                    "streak": 0,
+                    "last_answered_at": 0,
+                    "by_type": {
+                        qtype: {"total": 0, "correct": 0} for qtype in VALID_TYPES
+                    },
+                    "sources": {},
+                },
+            )
+            is_correct = bool(question.get("is_correct"))
+            qtype = str(question.get("type") or "")
+            stat["total"] += 1
+            answered += 1
+            stat["last_answered_at"] = max(stat["last_answered_at"], created_at)
+            if is_correct:
+                stat["correct"] += 1
+                stat["streak"] += 1
+            else:
+                stat["streak"] = 0
+            if qtype in VALID_TYPES:
+                stat["by_type"][qtype]["total"] += 1
+                if is_correct:
+                    stat["by_type"][qtype]["correct"] += 1
+
+            doc = _question_source_doc(question, paper, docs_by_id, docs_by_title)
+            if not doc:
+                continue
+            doc_id = str(doc.get("doc_id") or "").strip()
+            title = str(doc.get("title") or "").strip()
+            doc_key = doc_id or _title_key(title)
+            if not doc_key or not title:
+                continue
+            source_keys.add(doc_key)
+            source = stat["sources"].setdefault(
+                doc_key,
+                {"doc_id": doc_id, "title": title, "count": 0},
+            )
+            source["count"] += 1
+
+    items: list[dict] = []
+    for topic, stat in aggregate.items():
+        total = int(stat["total"])
+        correct = int(stat["correct"])
+        accuracy = _accuracy(correct, total)
+        sources = sorted(
+            stat["sources"].values(),
+            key=lambda item: (-int(item["count"]), str(item["title"])),
+        )
+        diagnosis = diagnoses.get(topic)
+        items.append(
+            {
+                "topic": topic,
+                "total": total,
+                "correct": correct,
+                "accuracy": accuracy,
+                "wrong_count": total - correct,
+                "streak": int(stat["streak"]),
+                "sample_state": "verified" if total >= 3 else "tentative",
+                "last_answered_at": int(stat["last_answered_at"]),
+                "by_type": {
+                    qtype: {
+                        "total": int(values["total"]),
+                        "correct": int(values["correct"]),
+                        "accuracy": _accuracy(
+                            int(values["correct"]), int(values["total"])
+                        ),
+                    }
+                    for qtype, values in stat["by_type"].items()
+                },
+                "source_docs": sources[:5],
+                "source_count": len(sources),
+                "diagnosis": diagnosis["text"] if diagnosis else "",
+                "diagnosis_at": int(diagnosis["at"]) if diagnosis else 0,
+            }
+        )
+
+    verified = [
+        item
+        for item in items
+        if item["sample_state"] == "verified" and item["accuracy"] < 0.8
+    ]
+    tentative = [
+        item
+        for item in items
+        if item["sample_state"] == "tentative" and item["accuracy"] < 0.8
+    ]
+    verified.sort(
+        key=lambda item: (
+            item["accuracy"],
+            -item["wrong_count"],
+            -item["last_answered_at"],
+            -item["total"],
+            item["topic"],
+        )
+    )
+    tentative.sort(
+        key=lambda item: (
+            item["accuracy"],
+            -item["last_answered_at"],
+            -item["total"],
+            item["topic"],
+        )
+    )
+    selected = (verified + tentative)[:5]
+    result = {
+        "days": days,
+        "start_at": cutoff,
+        "attempts": len(attempts),
+        "answered": answered,
+        "source_count": len(source_keys),
+        "weak_topics": selected,
+    }
+
+    with _RECENT_TOPIC_PROGRESS_CACHE_LOCK:
+        _RECENT_TOPIC_PROGRESS_CACHE = (cache_key, result)
+    return result
+
+
 def get_progress() -> dict:
     mastery = _ensure_mastery_schema()
     catalog = _topic_catalog()
@@ -3843,9 +4150,18 @@ def get_progress() -> dict:
     answered = sum(item["total"] for item in topics)
     correct = sum(item["correct"] for item in topics)
     guide = _build_learning_guide()
+    recent = get_recent_topic_progress(7)
     return {
         "topics": topics,
         "recent_attempts": attempts,
+        "recent_weak_topics": recent["weak_topics"],
+        "recent_window": {
+            "days": recent["days"],
+            "start_at": recent["start_at"],
+            "attempts": recent["attempts"],
+            "answered": recent["answered"],
+            "source_count": recent["source_count"],
+        },
         "mistake_count": len(list_mistakes(limit=10_000)),
         "answered_total": answered,
         "correct_total": correct,

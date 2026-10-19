@@ -20,11 +20,13 @@ import {
   analyze,
   cancelTranscriptionJob,
   createTranscriptionJob,
+  generateResumeAdvice,
   getActiveResume,
   getLlmConfig,
   getQuizProgress,
   listKnowledgeDocuments,
   listMistakes,
+  loadResumeAdvice,
   pollJob,
   getReviewDashboard,
   isAbortError,
@@ -42,6 +44,7 @@ import { QuizSetup } from './components/QuizSetup'
 import { ReportView } from './components/ReportView'
 import { ResumeManager } from './components/ResumeManager'
 import { ResumeAdvisor } from './components/ResumeAdvisor'
+import { TargetJobCard } from './components/TargetJobCard'
 import { WrongReviewPage } from './components/WrongReviewPage'
 import { Stepper } from './components/Stepper'
 import type {
@@ -52,6 +55,7 @@ import type {
   QuizAttempt,
   QuizPaper,
   QuizProgress,
+  ResumeAdvice,
   ResumeRecord,
   LlmConfig,
   ReviewDashboard,
@@ -122,6 +126,9 @@ export default function App() {
   const [company, setCompany] = useState(
     () => window.localStorage.getItem('opc-company') ?? '',
   )
+  const [targetRole, setTargetRole] = useState(
+    () => window.localStorage.getItem('opc-target-role') ?? '',
+  )
   const [resume, setResume] = useState(
     () => window.localStorage.getItem('opc-resume') ?? '',
   )
@@ -130,6 +137,9 @@ export default function App() {
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([])
   const [knowledgeChunkCount, setKnowledgeChunkCount] = useState(0)
   const [activeResume, setActiveResume] = useState<ResumeRecord | null>(null)
+  const [resumeAdvice, setResumeAdvice] = useState<ResumeAdvice | null>(null)
+  const [resumeAdviceBusy, setResumeAdviceBusy] = useState(false)
+  const [resumeAdviceError, setResumeAdviceError] = useState('')
   const [view, setView] = useState<WorkspaceView>('practice')
   const [quizPhase, setQuizPhase] = useState<QuizPhase>('setup')
   const [paper, setPaper] = useState<QuizPaper | null>(null)
@@ -158,12 +168,21 @@ export default function App() {
   } | null>(null)
 
   useEffect(() => {
+    // 页面已经完成首次渲染，移除 index.html 里的启动占位。
+    document.getElementById('boot')?.remove()
+  }, [])
+
+  useEffect(() => {
     window.localStorage.setItem('opc-jd', jd)
   }, [jd])
 
   useEffect(() => {
     window.localStorage.setItem('opc-company', company)
   }, [company])
+
+  useEffect(() => {
+    window.localStorage.setItem('opc-target-role', targetRole)
+  }, [targetRole])
 
   useEffect(() => {
     window.localStorage.setItem('opc-resume', resume)
@@ -180,6 +199,23 @@ export default function App() {
       .then(setActiveResume)
       .catch(() => setActiveResume(null))
   }, [])
+
+  useEffect(() => {
+    setResumeAdvice(null)
+    setResumeAdviceError('')
+    if (!activeResume) return
+    const resumeId = activeResume.resume_id
+    const charCount = activeResume.char_count
+    let cancelled = false
+    loadResumeAdvice(resumeId).then((cached) => {
+      if (!cancelled && cached && cached.char_count === charCount) {
+        setResumeAdvice(cached)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [activeResume])
 
   useEffect(() => {
     getLlmConfig()
@@ -346,6 +382,35 @@ export default function App() {
 
   const isTranscribing = job?.status === 'queued' || job?.status === 'running'
   const canAnalyze = Boolean(transcript.trim()) && !isTranscribing && phase === 'input'
+  const effectiveJd = targetRole.trim()
+    ? `目标岗位：${targetRole.trim()}\n${jd.trim()}`.trim()
+    : jd
+
+  const handleGenerateResumeAdvice = async () => {
+    if (!activeResume || resumeAdviceBusy) return
+    setResumeAdviceBusy(true)
+    setResumeAdviceError('')
+    try {
+      const result = await generateResumeAdvice({
+        company,
+        target_role: targetRole,
+        jd,
+        refresh: true,
+      })
+      setResumeAdvice(result)
+      window.setTimeout(() => {
+        document
+          .getElementById('resume-advisor')
+          ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }, 50)
+    } catch (adviceError) {
+      setResumeAdviceError(
+        adviceError instanceof Error ? adviceError.message : '简历分析失败，请重试。',
+      )
+    } finally {
+      setResumeAdviceBusy(false)
+    }
+  }
 
   const startAnalysis = async (overrideTranscript?: string) => {
     const source = (overrideTranscript ?? transcript).trim()
@@ -363,7 +428,7 @@ export default function App() {
       let knowledge = ''
       if (documents.length > 0) {
         try {
-          const query = `${jd}\n${resume}\n${source.slice(0, 1800)}`.trim()
+          const query = `${effectiveJd}\n${resume}\n${source.slice(0, 1800)}`.trim()
           const chunks = await searchKnowledge(
             query || source.slice(0, 1800),
             6,
@@ -385,7 +450,7 @@ export default function App() {
       const result = await analyze(
         {
           transcript: source,
-          jd,
+          jd: effectiveJd,
           company,
           resume,
           knowledge,
@@ -416,7 +481,7 @@ export default function App() {
     },
     // startAnalysis 依赖的状态在同一次渲染内已是最新值。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [jd, company, resume, documents, activeResume],
+    [jd, targetRole, company, resume, documents, activeResume],
   )
 
   const restart = () => {
@@ -453,7 +518,7 @@ export default function App() {
       <header className="border-b border-zinc-200 bg-white">
         <div
           className={`mx-auto flex flex-col items-stretch gap-3 py-4 sm:flex-row sm:items-center sm:justify-between sm:gap-4 ${
-            view === 'quiz' ? 'max-w-[1800px] px-3' : 'max-w-6xl px-4'
+            view === 'quiz' ? 'max-w-[1800px] px-3' : 'max-w-6xl px-4 2xl:max-w-[1600px]'
           }`}
         >
           <div className="flex items-center gap-3">
@@ -559,7 +624,7 @@ export default function App() {
 
       <main
         className={`mx-auto space-y-5 py-6 ${
-          view === 'quiz' ? 'max-w-[1800px] px-3' : 'max-w-6xl px-4'
+          view === 'quiz' ? 'max-w-[1800px] px-3' : 'max-w-6xl px-4 2xl:max-w-[1600px]'
         }`}
       >
         {view === 'practice' && <Stepper current={activeStep} />}
@@ -667,8 +732,19 @@ export default function App() {
         )}
 
         {view === 'practice' && phase === 'input' && (
-          <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
-            <section className="tool-card min-w-0">
+          <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px] 2xl:grid-cols-[280px_minmax(0,1fr)_360px]">
+            <aside className="min-w-0 lg:col-span-2 2xl:col-span-1 2xl:sticky 2xl:top-6 2xl:self-start">
+              <TargetJobCard
+                company={company}
+                targetRole={targetRole}
+                jd={jd}
+                onCompanyChange={setCompany}
+                onTargetRoleChange={setTargetRole}
+                onJdChange={setJd}
+              />
+            </aside>
+
+            <section className="tool-card min-w-0 lg:col-start-1 lg:row-start-2 2xl:col-start-2 2xl:row-start-1">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <h2 className="text-base font-semibold text-zinc-900">面试材料</h2>
                 <div className="flex flex-wrap rounded-lg border border-zinc-300 bg-zinc-100 p-1">
@@ -714,7 +790,7 @@ export default function App() {
               <div className="mt-5">
                 {inputMode === 'live' ? (
                   <MockInterview
-                    jd={jd}
+                    jd={effectiveJd}
                     company={company}
                     resume={resume}
                     resumeId={activeResume?.resume_id}
@@ -794,71 +870,52 @@ export default function App() {
               )}
             </section>
 
-            <aside className="min-w-0 space-y-5">
+            <aside className="min-w-0 space-y-5 lg:col-start-2 lg:row-start-2 2xl:col-start-3 2xl:row-start-1">
               <ResumeManager
+                key={activeResume?.resume_id ?? 'no-resume'}
                 activeResume={activeResume}
+                resume={resume}
                 onActiveResumeChange={setActiveResume}
+                onResumeChange={setResume}
               />
 
-              <ResumeAdvisor activeResume={activeResume} />
+              <ResumeAdvisor
+                key={activeResume?.resume_id ?? 'no-resume-advice'}
+                activeResume={activeResume}
+                advice={resumeAdvice}
+                busy={resumeAdviceBusy}
+                error={resumeAdviceError}
+                onGenerate={() => void handleGenerateResumeAdvice()}
+              />
 
-              <section className="tool-card">
-                <label htmlFor="company" className="field-label">
-                  目标公司
-                </label>
-                <input
-                  id="company"
-                  className="text-input"
-                  value={company}
-                  onChange={(event) => setCompany(event.target.value)}
-                  placeholder="填写投递的公司名称，用于对齐岗位背景与高频问题。"
-                />
-              </section>
-
-              <section className="tool-card">
-                <label htmlFor="jd" className="field-label">
-                  目标岗位 JD
-                </label>
-                <textarea
-                  id="jd"
-                  className="text-input min-h-44"
-                  value={jd}
-                  onChange={(event) => setJd(event.target.value)}
-                  placeholder="粘贴岗位职责和任职要求，用于生成更贴合的追问。"
-                />
-              </section>
-
-              <section className="tool-card">
-                <label htmlFor="resume" className="field-label">
-                  补充说明
-                </label>
-                <textarea
-                  id="resume"
-                  className="text-input min-h-28"
-                  value={resume}
-                  onChange={(event) => setResume(event.target.value)}
-                  placeholder="简历之外想补充的信息，例如近期学习方向、想重点被追问的项目。"
-                />
-                {!activeResume && (
-                  <p className="mt-2 text-xs leading-5 text-amber-700">
-                    还没有导入简历档案，面试官只能依据这里的文字提问。
-                  </p>
-                )}
-              </section>
-
-              <KnowledgeLibrary documents={documents} onDocumentsChange={setDocuments} />
-
-              {inputMode !== 'live' && (
+              <div className="space-y-2">
                 <button
                   type="button"
                   className="primary-btn w-full py-3 text-base"
-                  onClick={() => void startAnalysis()}
-                  disabled={!canAnalyze}
+                  onClick={() => void handleGenerateResumeAdvice()}
+                  disabled={!activeResume || resumeAdviceBusy}
                 >
-                  <Play className="size-5" aria-hidden="true" />
-                  开始 AI 分析
+                  {resumeAdviceBusy ? (
+                    <Loader2 className="size-5 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Play className="size-5" aria-hidden="true" />
+                  )}
+                  {resumeAdviceBusy ? 'AI 正在分析简历' : '开始 AI 分析'}
                 </button>
-              )}
+                <p className="text-center text-[11px] leading-4 text-zinc-500">
+                  基于简历和投递目标生成优化建议；修改目标后再次点击即可更新。
+                </p>
+                {canAnalyze && (
+                  <button
+                    type="button"
+                    className="secondary-btn w-full"
+                    onClick={() => void startAnalysis()}
+                  >
+                    <Play className="size-4" aria-hidden="true" />
+                    分析面试转写
+                  </button>
+                )}
+              </div>
               {uploadedFile && (
                 <p className="text-center text-xs text-zinc-500">
                   当前文件：{uploadedFile.name}（{formatBytes(uploadedFile.size)}）
@@ -899,7 +956,7 @@ export default function App() {
       )}
 
       <footer className="border-t border-zinc-200 bg-white py-4">
-        <p className="mx-auto flex max-w-6xl items-center justify-center gap-2 px-4 text-center text-xs text-zinc-500">
+        <p className="mx-auto flex max-w-6xl items-center justify-center gap-2 px-4 text-center text-xs text-zinc-500 2xl:max-w-[1600px]">
           <FileText className="size-4 shrink-0" aria-hidden="true" />
           录音、转写和知识库保存在本地 backend/data；转写和分析调用你配置的 API。
         </p>

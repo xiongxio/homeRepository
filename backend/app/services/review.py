@@ -1,6 +1,6 @@
 """错题复盘的独立调度状态。
 
-错题本负责“当前是否需要巩固”，复盘文件负责“什么时候再看、看几次后毕业”。
+错题本负责“当前是否需要巩固”，复盘文件负责“什么时候再看、看几次后归为已掌握”。
 两份数据分开，是为了保持普通刷题连续答对两次移出错题本的原有行为。
 """
 
@@ -450,7 +450,7 @@ def sync_wrong_answers(graded: list[dict], paper: dict) -> dict:
 
 
 def archive_by_question_key(key: str) -> None:
-    """手动移出错题本时保留复盘履历，只归档待复习状态。"""
+    """手动移出错题本时保留复盘履历，只标记为已移除。"""
     state = _load_state()
     changed = False
     now = int(time.time())
@@ -669,8 +669,13 @@ def generate_practice_paper(
     topic_id: str,
     total: int = 5,
     include_today: bool = False,
+    include_active: bool = False,
 ) -> dict:
-    """为一个知识点生成 5 道复盘变形题，并绑定本次要推进的复盘记录。"""
+    """为一个知识点生成 5 道复盘变形题，并绑定本次要推进的复盘记录。
+
+    默认只取已到期的待巩固记录；全部错题页需要针对任意待巩固知识点重做，
+    可以传 include_active=True，此时不再受 next_review_at 限制。
+    """
     from . import knowledge as knowledge_service
     from . import quiz as quiz_service
 
@@ -683,7 +688,8 @@ def generate_practice_paper(
         if item.get("topic_id") == topic_id
         and item.get("status") == "active"
         and (
-            int(item.get("next_review_at") or 0) <= now
+            include_active
+            or int(item.get("next_review_at") or 0) <= now
             or (
                 include_today
                 and int(item.get("created_at") or 0) >= today_start
@@ -739,11 +745,175 @@ def generate_practice_paper(
         "topic_id": topic_id,
         "topic": topic,
         "include_today": include_today,
+        "include_active": include_active,
         "review_ids": [item.get("review_id") for item in records],
         "requested_total": total,
     }
     quiz_service._write_json(
         quiz_service.PAPERS_DIR / f"{paper['paper_id']}.json",
+        paper,
+    )
+    return paper
+
+
+def _record_source_docs(record: dict) -> list[dict]:
+    lineage = record.get("source_lineage")
+    if not isinstance(lineage, dict):
+        lineage = {}
+    docs: list[dict] = []
+    for doc in lineage.get("source_docs") or record.get("source_docs") or []:
+        if not isinstance(doc, dict):
+            continue
+        doc_id = str(doc.get("doc_id") or "")
+        title = str(doc.get("title") or "")
+        if not doc_id and not title:
+            continue
+        if any(
+            item.get("doc_id") == doc_id and item.get("title") == title
+            for item in docs
+        ):
+            continue
+        docs.append({"doc_id": doc_id, "title": title})
+    if not docs:
+        doc_id = str(lineage.get("source_doc_id") or "")
+        title = str(record.get("source_title") or "")
+        if doc_id or title:
+            docs.append({"doc_id": doc_id, "title": title})
+    return docs
+
+
+def generate_redo_paper(
+    topic_id: str,
+    review_ids: list[str] | None = None,
+) -> dict:
+    """按组内待巩固原题组卷，题量与本次实际绑定的复盘记录数一致。"""
+    from . import quiz as quiz_service
+
+    key = str(topic_id or "").strip()
+    if not key:
+        raise ReviewError("缺少知识点标识。")
+
+    state = _load_state()
+    by_id = {
+        str(item.get("review_id") or ""): item
+        for item in state["records"]
+        if item.get("review_id")
+    }
+    requested: list[str] = []
+    for review_id in review_ids or []:
+        value = str(review_id or "").strip()
+        if value and value not in requested:
+            requested.append(value)
+
+    if requested:
+        records = [by_id[value] for value in requested if value in by_id]
+    else:
+        records = [
+            item
+            for item in state["records"]
+            if str(
+                item.get("topic_id")
+                or _normalise_topic_id(item.get("topic") or "")
+            )
+            == key
+            and item.get("status") == "active"
+        ]
+
+    records = [
+        item
+        for item in records
+        if item.get("status") == "active"
+        and str(
+            item.get("topic_id")
+            or _normalise_topic_id(item.get("topic") or "")
+        )
+        == key
+    ]
+    if requested and len(records) != len(requested):
+        raise ReviewError("组内错题状态已变化，请刷新页面后重试。")
+    if not records:
+        raise ReviewError("这个知识点当前没有可重做的待巩固错题。")
+
+    questions: list[dict] = []
+    paper_docs: list[dict] = []
+    for index, record in enumerate(records, start=1):
+        options = [
+            {
+                "key": str(option.get("key") or "").strip().upper(),
+                "text": str(option.get("text") or ""),
+            }
+            for option in record.get("options") or []
+            if isinstance(option, dict)
+            and str(option.get("key") or "").strip()
+        ]
+        answer = [
+            str(item).strip().upper()
+            for item in record.get("correct_answer") or []
+            if str(item).strip()
+        ]
+        if not options or not answer:
+            raise ReviewError(
+                "组内有错题缺少选项或答案，暂时无法按原题重做，请改用换题再练。"
+            )
+
+        docs = _record_source_docs(record)
+        for doc in docs:
+            if doc not in paper_docs:
+                paper_docs.append(doc)
+        first_doc = docs[0] if docs else {}
+        lineage = record.get("source_lineage")
+        if not isinstance(lineage, dict):
+            lineage = {}
+        questions.append(
+            {
+                "question_id": f"q{index}",
+                "type": str(record.get("type") or "single"),
+                "stem": str(record.get("stem") or ""),
+                "options": options,
+                "topic": str(record.get("topic") or "未分类"),
+                "difficulty": "mixed",
+                "answer": answer,
+                "explanation": str(record.get("explanation") or ""),
+                "source_title": str(
+                    record.get("source_title")
+                    or first_doc.get("title")
+                    or ""
+                ),
+                "source_doc_id": str(first_doc.get("doc_id") or ""),
+                "source_docs": docs,
+                "source_chunk_ids": list(lineage.get("source_chunk_ids") or []),
+            }
+        )
+
+    topic = str(records[0].get("topic") or "未分类")
+    paper_id = uuid.uuid4().hex
+    paper = {
+        "paper_id": paper_id,
+        "title": f"{topic} · 错题重做",
+        "keywords": [topic],
+        "doc_titles": [
+            doc["title"] for doc in paper_docs if doc.get("title")
+        ],
+        "doc_ids": [
+            doc["doc_id"] for doc in paper_docs if doc.get("doc_id")
+        ],
+        "source_docs": paper_docs,
+        "difficulty": "mixed",
+        "questions": questions,
+        "generation_context": {
+            "kind": "review_practice",
+            "topic_id": key,
+            "topic": topic,
+            "review_ids": [
+                str(item.get("review_id")) for item in records
+            ],
+            "requested_total": len(questions),
+            "redo_mode": "original",
+        },
+        "created_at": int(time.time()),
+    }
+    quiz_service._write_json(
+        quiz_service.PAPERS_DIR / f"{paper_id}.json",
         paper,
     )
     return paper

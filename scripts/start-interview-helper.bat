@@ -15,6 +15,9 @@ set "REQUIREMENTS=%BACKEND_DIR%\requirements.txt"
 set "DEPS_STAMP=%BACKEND_DIR%\.venv\.requirements-installed"
 set "PACKAGE_LOCK=%FRONTEND_DIR%\package-lock.json"
 set "FRONTEND_STAMP=%FRONTEND_DIR%\node_modules\.package-lock-installed"
+set "LOG_DIR=%PROJECT_DIR%\logs"
+set "BACKEND_INSTALL_LOG=%LOG_DIR%\backend-dependencies.log"
+set "FRONTEND_INSTALL_LOG=%LOG_DIR%\frontend-dependencies.log"
 set "PYTHON_EXTRA_ARGS="
 set "REQUIREMENTS_HASH="
 set "DEPS_STAMP_CONTENT="
@@ -33,6 +36,7 @@ if not exist "%REQUIREMENTS%" (
     echo [ERROR] Backend requirements not found: %REQUIREMENTS%
     goto :fail
 )
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
 
 for /f "delims=" %%H in ('certutil -hashfile "%REQUIREMENTS%" SHA256 ^| find /v ":"') do (
     if not defined REQUIREMENTS_HASH set "REQUIREMENTS_HASH=%%H"
@@ -112,18 +116,21 @@ if not exist "%VENV_PY%" (
 )
 
 if not "%REQUIREMENTS_HASH%"=="%DEPS_STAMP_CONTENT%" (
-    echo       Installing or updating backend dependencies. First run may take several minutes.
-    "%VENV_PY%" -m pip install --upgrade pip
+    echo [%time:~0,8%]       Installing or updating backend dependencies...
+    echo       First run may take several minutes. Details go to:
+    echo       %BACKEND_INSTALL_LOG%
+    "%VENV_PY%" -m pip install --upgrade pip > "%BACKEND_INSTALL_LOG%" 2>&1
     if errorlevel 1 (
-        echo [ERROR] Failed to upgrade pip. Check network or Python environment.
+        call :report_install_failure "pip" "%BACKEND_INSTALL_LOG%"
         goto :fail
     )
-    "%VENV_PY%" -m pip install -r "%REQUIREMENTS%"
+    "%VENV_PY%" -m pip install -r "%REQUIREMENTS%" >> "%BACKEND_INSTALL_LOG%" 2>&1
     if errorlevel 1 (
-        echo [ERROR] Failed to install backend dependencies.
+        call :report_install_failure "backend dependencies" "%BACKEND_INSTALL_LOG%"
         goto :fail
     )
     > "%DEPS_STAMP%" echo %REQUIREMENTS_HASH%
+    echo [%time:~0,8%]       Backend dependencies are ready.
 )
 
 where ffmpeg >nul 2>&1
@@ -194,16 +201,19 @@ if not defined HAS_ACTIVE_KEY (
 
 echo [3/5] Checking frontend dependencies...
 if not "%PACKAGE_LOCK_HASH%"=="%FRONTEND_STAMP_CONTENT%" (
-    echo       Installing or updating frontend dependencies. This may take several minutes.
+    echo [%time:~0,8%]       Installing or updating frontend dependencies...
+    echo       First run may take several minutes. Details go to:
+    echo       %FRONTEND_INSTALL_LOG%
     pushd "%FRONTEND_DIR%" >nul
-    call npm ci
+    call npm ci > "%FRONTEND_INSTALL_LOG%" 2>&1
     if errorlevel 1 (
         popd >nul
-        echo [ERROR] Failed to install frontend dependencies. Run npm install in the frontend directory to debug.
+        call :report_install_failure "frontend dependencies" "%FRONTEND_INSTALL_LOG%"
         goto :fail
     )
     popd >nul
     > "%FRONTEND_STAMP%" echo %PACKAGE_LOCK_HASH%
+    echo [%time:~0,8%]       Frontend dependencies are ready.
 )
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%\scripts\ensure-frontend-port.ps1"
@@ -214,7 +224,7 @@ if errorlevel 1 (
     goto :fail
 )
 
-echo [4/5] Cleaning stale services and starting backend...
+echo [%time:~0,8%] [4/5] Cleaning stale services and starting backend...
 for %%P in (%BACKEND_PORT% %FRONTEND_PORT%) do (
     for /f "tokens=5" %%A in ('netstat -ano ^| findstr /R /C:"LISTENING" ^| findstr /R /C:":%%P "') do (
         echo       Stopping process PID=%%A on port %%P
@@ -238,10 +248,10 @@ if not defined BACKEND_OK (
     echo [WARN] Backend did not become ready within 45 seconds. Check the minimized backend window.
     goto :fail
 ) else (
-    echo       Backend is ready.
+    echo [%time:~0,8%]       Backend is ready.
 )
 
-echo [5/5] Starting frontend...
+echo [%time:~0,8%] [5/5] Starting frontend...
 start "Interview Assistant Frontend" /D "%FRONTEND_DIR%" /MIN cmd /c "npm run dev ^& pause"
 
 set "FRONTEND_OK="
@@ -260,6 +270,17 @@ if not defined FRONTEND_OK (
     goto :fail
 )
 
+echo [%time:~0,8%]       Frontend port is ready. Warming up the page...
+rem A listening port does not mean the page is servable yet. Request the
+rem entry HTML and the first modules so Vite finishes dependency optimization
+rem and its first transform before the browser is opened.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%\scripts\warmup-frontend.ps1" -Port %FRONTEND_PORT%
+if errorlevel 1 (
+    echo [WARN] Frontend warm-up did not finish. The browser will still be opened.
+) else (
+    echo [%time:~0,8%]       Frontend warm-up complete.
+)
+
 echo ============================================
 echo   Startup complete
 echo   URL: http://127.0.0.1:%FRONTEND_PORT%/
@@ -270,9 +291,16 @@ echo ============================================
 echo.
 
 start "" "http://127.0.0.1:%FRONTEND_PORT%/"
-echo Browser opened. This window closes in 5 seconds...
+echo [%time:~0,8%] Browser opened. This window closes in 5 seconds...
 ping -n 6 127.0.0.1 >nul
 exit /b 0
+
+:report_install_failure
+echo [ERROR] Failed to install %~1.
+echo         Recent log output:
+powershell -NoProfile -ExecutionPolicy Bypass -Command "if (Test-Path -LiteralPath '%~2') { Get-Content -LiteralPath '%~2' -Tail 40 }"
+echo         Full log: %~2
+exit /b 1
 
 :fail
 echo.

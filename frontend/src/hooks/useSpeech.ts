@@ -35,6 +35,8 @@ interface SpeechRecognitionLike {
 
 type SpeechRecognitionCtor = new () => SpeechRecognitionLike
 
+class SpeechPlaybackError extends Error {}
+
 function getRecognitionCtor(): SpeechRecognitionCtor | null {
   if (typeof window === 'undefined') return null
   const scope = window as unknown as {
@@ -61,10 +63,14 @@ export function useSpeech({
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [interimText, setInterimText] = useState('')
   const [speechError, setSpeechError] = useState('')
+  const [voiceError, setVoiceError] = useState('')
   const [usingFallbackVoice, setUsingFallbackVoice] = useState(false)
 
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null)
   const finalTextRef = useRef('')
+  const interimTextRef = useRef('')
+  const finalizeRef = useRef<(() => void) | null>(null)
+  const acceptResultsRef = useRef(true)
   const shouldRestartRef = useRef(false)
   const onFinalTextRef = useRef(onFinalText)
   const audioRef = useRef<HTMLAudioElement | null>(null)
@@ -99,6 +105,17 @@ export function useSpeech({
   const synthesisSupported =
     typeof window !== 'undefined' && 'speechSynthesis' in window
 
+  const collectTranscript = useCallback(
+    () => `${finalTextRef.current}${interimTextRef.current}`.trim(),
+    [],
+  )
+
+  const clearTranscript = useCallback(() => {
+    finalTextRef.current = ''
+    interimTextRef.current = ''
+    setInterimText('')
+  }, [])
+
   const ensureRecognition = useCallback((): SpeechRecognitionLike | null => {
     if (recognitionRef.current) return recognitionRef.current
     const Ctor = getRecognitionCtor()
@@ -111,6 +128,7 @@ export function useSpeech({
     recognition.maxAlternatives = 1
 
     recognition.onresult = (event) => {
+      if (!acceptResultsRef.current) return
       let interim = ''
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
         const result = event.results[i]
@@ -121,7 +139,10 @@ export function useSpeech({
           interim += text
         }
       }
-      setInterimText(interim)
+      interimTextRef.current = interim
+      // final result 到达后不要清空界面，否则用户会以为刚才的话没被录进去。
+      // 这里展示“已确认文本 + 当前临时文本”的累计转写。
+      setInterimText(`${finalTextRef.current}${interim}`.trim())
     }
 
     recognition.onerror = (event) => {
@@ -136,6 +157,15 @@ export function useSpeech({
     }
 
     recognition.onend = () => {
+      const finalize = finalizeRef.current
+      if (finalize) {
+        finalizeRef.current = null
+        shouldRestartRef.current = false
+        setIsListening(false)
+        // 给浏览器留一点时间把最后一条 final result 派发完。
+        window.setTimeout(finalize, 300)
+        return
+      }
       // continuous 模式在静音时也会自动结束，需要主动续上。
       if (shouldRestartRef.current) {
         try {
@@ -158,7 +188,9 @@ export function useSpeech({
       setSpeechError('当前浏览器不支持语音识别，请使用 Chrome 或 Edge。')
       return
     }
+    acceptResultsRef.current = true
     finalTextRef.current = ''
+    interimTextRef.current = ''
     setInterimText('')
     setSpeechError('')
     shouldRestartRef.current = true
@@ -172,21 +204,66 @@ export function useSpeech({
   }, [ensureRecognition])
 
   const stopListening = useCallback((): string => {
+    acceptResultsRef.current = false
     shouldRestartRef.current = false
     const recognition = recognitionRef.current
     if (recognition) {
       try {
-        recognition.stop()
+        recognition.abort()
       } catch {
         // 忽略未启动时的异常。
       }
     }
-    setIsListening(false)
-    const text = `${finalTextRef.current}${interimText}`.trim()
+    const finalize = finalizeRef.current
+    finalizeRef.current = null
     finalTextRef.current = ''
+    interimTextRef.current = ''
     setInterimText('')
-    return text
-  }, [interimText])
+    setIsListening(false)
+    // 取消时如果还有等待收尾的 Promise，立即用空文本放行，避免一直挂着。
+    finalize?.()
+    return ''
+  }, [])
+
+  /**
+   * 点击「回答完毕」时使用：先让浏览器把最后一段语音落成 final result，
+   * 再返回完整转写文本。直接 stop 后立刻读 ref 会丢掉最后半句话。
+   */
+  const finishListening = useCallback((): Promise<string> => {
+    shouldRestartRef.current = false
+    const recognition = recognitionRef.current
+    if (!recognition) {
+      acceptResultsRef.current = false
+      setIsListening(false)
+      const text = collectTranscript()
+      clearTranscript()
+      return Promise.resolve(text)
+    }
+
+    return new Promise<string>((resolve) => {
+      let settled = false
+      let timer = 0
+      const finish = () => {
+        if (settled) return
+        settled = true
+        window.clearTimeout(timer)
+        if (finalizeRef.current === finish) finalizeRef.current = null
+        acceptResultsRef.current = false
+        setIsListening(false)
+        const text = collectTranscript()
+        clearTranscript()
+        resolve(text)
+      }
+      finalizeRef.current = finish
+      // onend 通常会很快到达；这个超时只用于兜底，防止浏览器不派发 onend。
+      timer = window.setTimeout(finish, 1500)
+      try {
+        recognition.stop()
+      } catch {
+        finish()
+      }
+    })
+  }, [clearTranscript, collectTranscript])
 
   const releaseAudio = useCallback(() => {
     const audio = audioRef.current
@@ -273,8 +350,12 @@ export function useSpeech({
         }
         const utterance = new SpeechSynthesisUtterance(text)
         utterance.lang = lang
-        utterance.rate = 1
+        utterance.rate = Math.min(2, Math.max(0.5, 1 + rateRef.current / 100))
         utterance.pitch = 1
+        const chineseVoice = window.speechSynthesis
+          .getVoices()
+          .find((item) => item.lang.toLowerCase().startsWith('zh'))
+        if (chineseVoice) utterance.voice = chineseVoice
         const finish = () => resolve()
         utterance.onend = finish
         utterance.onerror = finish
@@ -286,17 +367,42 @@ export function useSpeech({
 
   /** 等待音频播放结束（或被抢占释放）。 */
   const awaitPlayback = useCallback((audio: HTMLAudioElement): Promise<void> => {
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false
       const finish = () => {
+        if (settled) return
+        settled = true
         if (playbackResolveRef.current === finish) {
           playbackResolveRef.current = null
         }
         resolve()
       }
+      const fail = (error: Error) => {
+        if (settled) return
+        settled = true
+        if (playbackResolveRef.current === finish) {
+          playbackResolveRef.current = null
+        }
+        reject(error)
+      }
       playbackResolveRef.current = finish
       audio.onended = finish
-      audio.onerror = finish
-      audio.play().catch(finish)
+      audio.onerror = () =>
+        fail(new SpeechPlaybackError('音频加载失败，请检查网络或重新选择音色。'))
+      audio.play().catch((error: unknown) => {
+        const blocked =
+          typeof error === 'object' &&
+          error !== null &&
+          'name' in error &&
+          (error as { name?: unknown }).name === 'NotAllowedError'
+        fail(
+          new SpeechPlaybackError(
+            blocked
+              ? '浏览器阻止了音频播放，请再点一次页面后重试。'
+              : '音频播放失败，请检查系统音量和输出设备。',
+          ),
+        )
+      })
     })
   }, [])
 
@@ -305,12 +411,17 @@ export function useSpeech({
    * 返回 false 表示环境不支持或流不可用，由调用方回落到整段合成。
    */
   const playStreamed = useCallback(
-    async (content: string, generation: number, signal: AbortSignal): Promise<boolean> => {
+    async (
+      content: string,
+      generation: number,
+      signal: AbortSignal,
+      selectedVoice: string,
+    ): Promise<boolean> => {
       if (typeof window === 'undefined' || typeof window.MediaSource === 'undefined') return false
       if (!window.MediaSource.isTypeSupported('audio/mpeg')) return false
 
       const response = await streamSpeech(
-        { text: content, voice: voiceRef.current, rate: rateRef.current },
+        { text: content, voice: selectedVoice, rate: rateRef.current },
         signal,
       )
       if (generation !== speechGenerationRef.current) return true
@@ -404,9 +515,14 @@ export function useSpeech({
 
   /** 整段合成后播放：流式不可用时的兜底路径。 */
   const playWhole = useCallback(
-    async (content: string, generation: number, signal: AbortSignal): Promise<void> => {
+    async (
+      content: string,
+      generation: number,
+      signal: AbortSignal,
+      selectedVoice: string,
+    ): Promise<void> => {
       const blob = await synthesiseSpeech(
-        { text: content, voice: voiceRef.current, rate: rateRef.current },
+        { text: content, voice: selectedVoice, rate: rateRef.current },
         signal,
       )
       if (generation !== speechGenerationRef.current) return
@@ -444,9 +560,10 @@ export function useSpeech({
   )
 
   const speak = useCallback(
-    async (text: string): Promise<void> => {
+    async (text: string, voiceOverride?: string): Promise<void> => {
       const content = text.trim()
       if (!content) return
+      const selectedVoice = voiceOverride || voiceRef.current
 
       // 抢占式播报：作废上一轮，本轮领取新的世代号。
       const generation = invalidateSpeech()
@@ -455,19 +572,48 @@ export function useSpeech({
       const controller = new AbortController()
       synthesisAbortRef.current = controller
       setIsSpeaking(true)
+      setVoiceError('')
+      setUsingFallbackVoice(false)
 
       try {
         // 优先走流式：首字节约 1 秒即可起播，整段合成要等 2 到 4 秒。
-        const streamed = await playStreamed(content, generation, controller.signal)
+        let streamed = false
+        try {
+          streamed = await playStreamed(
+            content,
+            generation,
+            controller.signal,
+            selectedVoice,
+          )
+        } catch (error) {
+          if (generation !== speechGenerationRef.current) return
+          if (error instanceof SpeechPlaybackError) {
+            setVoiceError(error.message)
+            return
+          }
+          // 流式请求本身失败时，继续尝试整段合成。
+        }
         if (generation !== speechGenerationRef.current) return
         if (!streamed) {
-          await playWhole(content, generation, controller.signal)
+          // 流式路径如果已经创建了 MediaSource 但最终不可用，先释放再整段合成。
+          releaseAudio()
+          try {
+            await playWhole(content, generation, controller.signal, selectedVoice)
+          } catch (error) {
+            if (generation !== speechGenerationRef.current) return
+            if (error instanceof SpeechPlaybackError) {
+              setVoiceError(error.message)
+              return
+            }
+            if (!synthesisSupported) {
+              setVoiceError('神经音色暂时不可用，当前浏览器也不支持备用语音。')
+              return
+            }
+            // 网络异常或后端不可用时退回浏览器语音，保证面试不中断。
+            setUsingFallbackVoice(true)
+            await speakWithBrowser(content, generation)
+          }
         }
-      } catch {
-        if (generation !== speechGenerationRef.current) return
-        // 网络异常或后端不可用时退回浏览器语音，保证面试不中断。
-        setUsingFallbackVoice(true)
-        await speakWithBrowser(content, generation)
       } finally {
         // 只有仍然属于当前世代时才清理状态，否则会误关新一轮的播报。
         if (generation === speechGenerationRef.current) {
@@ -496,8 +642,12 @@ export function useSpeech({
 
   useEffect(() => {
     return () => {
+      acceptResultsRef.current = false
       shouldRestartRef.current = false
       recognitionRef.current?.abort()
+      const finalize = finalizeRef.current
+      finalizeRef.current = null
+      finalize?.()
       speechGenerationRef.current += 1
       synthesisAbortRef.current?.abort()
       playbackResolveRef.current?.()
@@ -533,11 +683,13 @@ export function useSpeech({
     isSpeaking,
     interimText,
     speechError,
+    voiceError,
     recognitionSupported,
     synthesisSupported,
     usingFallbackVoice,
     startListening,
     stopListening,
+    finishListening,
     speak,
     stopSpeaking,
     warmUpOutput,

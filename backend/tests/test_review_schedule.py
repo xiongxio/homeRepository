@@ -333,6 +333,111 @@ class ReviewScheduleTests(unittest.TestCase):
             expression_service.SPEAKING_MATERIAL_CACHE_DIR = originals["material_dir"]
             expression_service.GENERATED_QUESTION_CACHE_DIR = originals["generated_dir"]
 
+    def test_knowledge_expression_returns_pending_while_generation_runs(self):
+        expression_dir = self.data_dir / "expression"
+        with (
+            patch.object(
+                expression_service,
+                "KNOWLEDGE_POOL_DIR",
+                expression_dir / "knowledge_pools",
+            ),
+            patch.object(
+                expression_service,
+                "GENERATED_QUESTION_CACHE_DIR",
+                expression_dir / "generated_questions",
+            ),
+            patch.object(
+                expression_service,
+                "_first_chunks_for_documents",
+                return_value=[
+                    {
+                        "doc_id": "doc_api",
+                        "title": "接口测试讲义",
+                        "text": "接口断言要校验状态码、业务字段和契约。",
+                    }
+                ],
+            ),
+            patch.object(
+                expression_service,
+                "_get_or_start_generation",
+                return_value=Queue(),
+            ),
+            patch.object(
+                expression_service,
+                "_is_generation_pending",
+                return_value=True,
+            ),
+        ):
+            result = expression_service.drill_question(
+                "ai_app_dev",
+                "",
+                ["doc_api"],
+                "knowledge",
+                "knowledge",
+                "",
+                "",
+                "pending-nonce",
+            )
+
+        self.assertTrue(result["generation_pending"])
+        self.assertEqual("pending-nonce", result["pending_token"])
+        self.assertEqual(1500, result["retry_after_ms"])
+        self.assertEqual("knowledge", result["source_type"])
+
+    def test_knowledge_expression_surfaces_generation_failure(self):
+        expression_dir = self.data_dir / "expression"
+        with (
+            patch.object(
+                expression_service,
+                "KNOWLEDGE_POOL_DIR",
+                expression_dir / "knowledge_pools",
+            ),
+            patch.object(
+                expression_service,
+                "GENERATED_QUESTION_CACHE_DIR",
+                expression_dir / "generated_questions",
+            ),
+            patch.object(
+                expression_service,
+                "_first_chunks_for_documents",
+                return_value=[
+                    {
+                        "doc_id": "doc_api",
+                        "title": "接口测试讲义",
+                        "text": "接口断言要校验状态码、业务字段和契约。",
+                    }
+                ],
+            ),
+            patch.object(
+                expression_service,
+                "_get_or_start_generation",
+                return_value=Queue(),
+            ),
+            patch.object(
+                expression_service,
+                "_is_generation_pending",
+                return_value=False,
+            ),
+            patch.object(
+                expression_service,
+                "_generation_failure",
+                return_value="表达题生成失败：模型返回超时。",
+            ),
+        ):
+            with self.assertRaises(expression_service.ExpressionError) as raised:
+                expression_service.drill_question(
+                    "ai_app_dev",
+                    "",
+                    ["doc_api"],
+                    "knowledge",
+                    "knowledge",
+                    "",
+                    "",
+                    "failed-nonce",
+                )
+
+        self.assertIn("模型返回超时", str(raised.exception))
+
     def test_expression_question_merges_same_topic_mistakes_into_one_open_question(self):
         first = self._question()
         second = self._question(
@@ -895,6 +1000,88 @@ class ReviewScheduleTests(unittest.TestCase):
         self.assertTrue(paper["generation_context"]["include_today"])
         self.assertEqual(1, len(paper["generation_context"]["review_ids"]))
         fake_generate.assert_called_once()
+
+    def test_include_active_allows_practice_before_due(self):
+        question = self._question()
+        review_service.sync_wrong_answers([question], self._paper([question]))
+
+        with self.assertRaises(review_service.ReviewError):
+            review_service.generate_practice_paper("rag分块")
+
+        fake_paper = {
+            **self._paper([question]),
+            "paper_id": "generated_active_review_paper",
+        }
+        with (
+            patch(
+                "backend.app.services.knowledge.list_documents",
+                return_value=[{"doc_id": "doc_rag", "title": "RAG 讲义"}],
+            ),
+            patch(
+                "backend.app.services.quiz.generate_paper",
+                return_value=fake_paper,
+            ),
+        ):
+            paper = review_service.generate_practice_paper(
+                "rag分块",
+                include_active=True,
+            )
+
+        self.assertEqual("generated_active_review_paper", paper["paper_id"])
+        self.assertTrue(paper["generation_context"]["include_active"])
+        self.assertEqual(1, len(paper["generation_context"]["review_ids"]))
+
+    def test_original_redo_paper_matches_group_question_count(self):
+        first = self._question()
+        second = self._question(stem="另一道 RAG 分块错题", correct="A")
+        second["type"] = "judge"
+        second["options"] = [
+            {"key": "A", "text": "正确"},
+            {"key": "B", "text": "错误"},
+        ]
+        review_service.sync_wrong_answers(
+            [first, second],
+            self._paper([first, second]),
+        )
+        records = review_service.list_records()
+        review_ids = [record["review_id"] for record in records]
+
+        paper = review_service.generate_redo_paper("rag分块", review_ids)
+
+        self.assertEqual(2, len(paper["questions"]))
+        self.assertEqual(2, paper["generation_context"]["requested_total"])
+        self.assertEqual(2, len(paper["generation_context"]["review_ids"]))
+        self.assertEqual("review_practice", paper["generation_context"]["kind"])
+        self.assertEqual("original", paper["generation_context"]["redo_mode"])
+        self.assertEqual(["B"], paper["questions"][0]["answer"])
+        self.assertEqual("judge", paper["questions"][1]["type"])
+
+        public = quiz_service.get_paper(paper["paper_id"])
+        self.assertNotIn("answer", public["questions"][0])
+        self.assertEqual(2, len(public["questions"]))
+
+    def test_original_redo_pass_advances_bound_records(self):
+        question = self._question()
+        review_service.sync_wrong_answers([question], self._paper([question]))
+        record = review_service.list_records()[0]
+        paper = review_service.generate_redo_paper(
+            "rag分块",
+            [record["review_id"]],
+        )
+        correct = dict(question)
+        correct.update(
+            {
+                "is_correct": True,
+                "user_answer": ["B"],
+                "user_answer_text": "B",
+            }
+        )
+
+        review_service.sync_grade([correct], paper)
+
+        updated = review_service.list_records()[0]
+        self.assertEqual(1, updated["review_stage"])
+        self.assertGreater(updated["next_review_at"], int(time.time()))
 
     def test_today_new_leaves_after_pass_and_stays_after_fail(self):
         question = self._question()

@@ -87,7 +87,11 @@ def _normalise(text: str, voice: str, rate: int, pitch: int) -> tuple[str, str, 
         raise TTSError("待合成的文本为空。")
     if len(text) > MAX_TEXT_CHARS:
         text = text[:MAX_TEXT_CHARS]
-    voice = voice if voice in VOICE_IDS else DEFAULT_VOICE
+    if voice and voice not in VOICE_IDS:
+        # 不要静默换成默认音色，否则前端以为自己在用选中音色，
+        # 实际听到的却是另一个人，问题很难定位。
+        raise TTSError(f"不支持的音色：{voice}")
+    voice = voice or DEFAULT_VOICE
     return text, voice, _clamp_percent(rate, -50, 50), _clamp_percent(pitch, -50, 50)
 
 

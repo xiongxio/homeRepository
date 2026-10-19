@@ -112,6 +112,13 @@ class ResumeProfileUpdate(BaseModel):
     profile: dict
 
 
+class ResumeAdviceRequest(BaseModel):
+    company: str = ""
+    target_role: str = ""
+    jd: str = ""
+    refresh: bool = False
+
+
 class TopicExtractRequest(BaseModel):
     doc_ids: list[str] = Field(default_factory=list)
     refresh: bool = False
@@ -174,6 +181,10 @@ class QuizSubmitRequest(BaseModel):
 
 class ReviewErrorCauseRequest(BaseModel):
     cause: str = Field(pattern="^(概念不清|概念混淆|粗心|超纲)$")
+
+
+class ReviewRedoRequest(BaseModel):
+    review_ids: list[str] = Field(default_factory=list)
 
 
 class TTSRequest(BaseModel):

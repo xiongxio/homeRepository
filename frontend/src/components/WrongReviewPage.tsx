@@ -20,6 +20,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   generateQuizPaper,
   generateReviewPractice,
+  generateReviewRedo,
   getQuizDocumentProgress,
   getQuizProgress,
   getReviewDashboard,
@@ -57,11 +58,30 @@ const TYPE_LABEL: Record<string, string> = {
   multiple: '多选题',
   judge: '判断题',
 }
+const TYPE_ORDER: Record<string, number> = {
+  single: 0,
+  multiple: 1,
+  judge: 2,
+}
 
 const STATUS_LABEL: Record<ReviewStatus, string> = {
   active: '待巩固',
-  graduated: '已毕业',
-  archived: '已归档',
+  graduated: '已掌握',
+  archived: '已移除',
+}
+
+interface ReviewRecordGroup {
+  key: string
+  topicId: string
+  topic: string
+  records: ReviewRecord[]
+  activeCount: number
+  graduatedCount: number
+  archivedCount: number
+  nextReviewAt: number
+  typeCounts: { type: string; count: number }[]
+  sourceDocs: string[]
+  updatedAt: number
 }
 
 const ERROR_CAUSES = ['概念不清', '概念混淆', '粗心', '超纲'] as const
@@ -129,6 +149,7 @@ export function WrongReviewPage({
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [practiceBusy, setPracticeBusy] = useState('')
+  const [redoBusy, setRedoBusy] = useState('')
   const [savingCause, setSavingCause] = useState('')
   const [expandedTask, setExpandedTask] = useState('')
   const [statusFilter, setStatusFilter] = useState<RecordStatusFilter>('all')
@@ -165,11 +186,17 @@ export function WrongReviewPage({
     void loadData()
   }, [loadData])
 
-  const handlePractice = async (topicId: string, includeToday = false) => {
+  const handlePractice = async (
+    topicId: string,
+    includeToday = false,
+    includeActive = false,
+  ) => {
     setPracticeBusy(topicId)
     setError('')
     try {
-      onPaperReady(await generateReviewPractice(topicId, includeToday))
+      onPaperReady(
+        await generateReviewPractice(topicId, includeToday, includeActive),
+      )
     } catch (practiceError) {
       setError(practiceError instanceof Error ? practiceError.message : '复盘练习组卷失败。')
     } finally {
@@ -208,6 +235,21 @@ export function WrongReviewPage({
       )
     } finally {
       setDocumentPracticeBusy('')
+    }
+  }
+
+  const handleRedoGroup = async (topicId: string, reviewIds: string[]) => {
+    if (reviewIds.length === 0) return
+    setRedoBusy(topicId)
+    setError('')
+    try {
+      onPaperReady(await generateReviewRedo(topicId, reviewIds))
+    } catch (redoError) {
+      setError(
+        redoError instanceof Error ? redoError.message : '错题重做组卷失败。',
+      )
+    } finally {
+      setRedoBusy('')
     }
   }
 
@@ -295,7 +337,96 @@ export function WrongReviewPage({
       )
   }, [keyword, records, statusFilter])
 
+  const recordGroups = useMemo(() => {
+    const groups = new Map<string, ReviewRecordGroup>()
+    for (const record of filteredRecords) {
+      const topicId = record.topic_id || record.topic
+      let group = groups.get(topicId)
+      if (!group) {
+        group = {
+          key: topicId,
+          topicId,
+          topic: record.topic,
+          records: [],
+          activeCount: 0,
+          graduatedCount: 0,
+          archivedCount: 0,
+          nextReviewAt: 0,
+          typeCounts: [],
+          sourceDocs: [],
+          updatedAt: 0,
+        }
+        groups.set(topicId, group)
+      }
+      group.records.push(record)
+      if (record.status === 'active') {
+        group.activeCount += 1
+        const next = record.next_review_at ?? 0
+        if (next > 0 && (group.nextReviewAt === 0 || next < group.nextReviewAt)) {
+          group.nextReviewAt = next
+        }
+      } else if (record.status === 'graduated') {
+        group.graduatedCount += 1
+      } else if (record.status === 'archived') {
+        group.archivedCount += 1
+      }
+      group.updatedAt = Math.max(group.updatedAt, record.updated_at ?? 0)
+      const lineage = record.source_lineage ?? {}
+      const titles = [record.source_title, ...(lineage.paper_doc_titles ?? [])]
+      for (const title of titles) {
+        if (title && !group.sourceDocs.includes(title)) {
+          group.sourceDocs.push(title)
+        }
+      }
+    }
+
+    return Array.from(groups.values())
+      .map((group) => {
+        group.records.sort(
+          (left, right) =>
+            (TYPE_ORDER[left.type] ?? 9) - (TYPE_ORDER[right.type] ?? 9) ||
+            (right.wrong_count ?? 0) - (left.wrong_count ?? 0) ||
+            (right.updated_at ?? 0) - (left.updated_at ?? 0),
+        )
+        const counts = new Map<string, number>()
+        for (const record of group.records) {
+          counts.set(record.type, (counts.get(record.type) ?? 0) + 1)
+        }
+        group.typeCounts = Array.from(counts.entries())
+          .map(([type, count]) => ({ type, count }))
+          .sort(
+            (left, right) =>
+              (TYPE_ORDER[left.type] ?? 9) - (TYPE_ORDER[right.type] ?? 9),
+          )
+        return group
+      })
+      .sort(
+        (left, right) =>
+          Number(right.activeCount > 0) - Number(left.activeCount > 0) ||
+          right.updatedAt - left.updatedAt ||
+          right.records.length - left.records.length,
+      )
+  }, [filteredRecords])
+
   const moduleStats = progress?.module_stats ?? []
+  const emptyStateText = (() => {
+    const hasKeyword = keyword.trim().length > 0
+    if (hasKeyword) {
+      return statusFilter === 'all'
+        ? '没有匹配的复盘记录，换个关键词试试。'
+        : `没有匹配的${STATUS_LABEL[statusFilter]}错题，换个关键词试试。`
+    }
+    if (statusFilter === 'graduated') {
+      return '还没有已掌握的错题。完成 1/3/7/15 天间隔复习后会自动归入这里。'
+    }
+    if (statusFilter === 'archived') {
+      return '还没有已移除的错题。手动移出错题本后会保留在这里。'
+    }
+    if (statusFilter === 'active') {
+      return '没有待巩固的错题。'
+    }
+    return '还没有复盘记录。'
+  })()
   const activeModule = selectedModule || moduleStats[0]?.module || ''
   const moduleTopics = (progress?.topics ?? []).filter(
     (item) => moduleLabel(item.module || '') === activeModule,
@@ -335,7 +466,7 @@ export function WrongReviewPage({
             {dashboard && (
               <span className="rounded-lg bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-700">
                 今日待复盘 {dashboard.due_count} · 待巩固 {dashboard.active_count} ·
-                已毕业 {dashboard.graduated_count}
+                已掌握 {dashboard.graduated_count}
               </span>
             )}
             {dashboard && (dashboard.today_new_count ?? 0) > 0 && (
@@ -926,76 +1057,252 @@ export function WrongReviewPage({
             </div>
             <select
               aria-label="按复盘状态筛选"
+              title="已掌握：完成 1/3/7/15 天间隔复习；已移除：手动移出错题本，仅保留历史记录。"
               className="h-11 rounded-lg border border-zinc-300 bg-white px-3 text-sm text-zinc-700"
               value={statusFilter}
               onChange={(event) => setStatusFilter(event.target.value as RecordStatusFilter)}
             >
               <option value="all">全部状态</option>
               <option value="active">待巩固</option>
-              <option value="graduated">已毕业</option>
-              <option value="archived">已归档</option>
+              <option value="graduated">已掌握</option>
+              <option value="archived">已移除</option>
             </select>
           </div>
 
-          {filteredRecords.length === 0 ? (
-            <p className="mt-4 text-sm text-zinc-500">没有匹配的复盘记录。</p>
+          {recordGroups.length === 0 ? (
+            <p className="mt-4 text-sm text-zinc-500">{emptyStateText}</p>
           ) : (
-            <ul className="mt-4 space-y-3">
-              {filteredRecords.map((record) => (
-                <li key={record.review_id} className="rounded-lg border border-zinc-200 p-3.5">
-                  <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="rounded-md bg-zinc-100 px-2 py-0.5 font-medium text-zinc-700">
-                      {TYPE_LABEL[record.type] ?? record.type}
-                    </span>
-                    <span className="rounded-md bg-zinc-100 px-2 py-0.5 text-zinc-600">
-                      {record.topic}
-                    </span>
-                    <span
-                      className={`rounded-md px-2 py-0.5 font-medium ${
-                        record.status === 'graduated'
-                          ? 'bg-emerald-100 text-emerald-700'
-                          : record.status === 'archived'
-                            ? 'bg-zinc-100 text-zinc-500'
-                            : 'bg-amber-100 text-amber-800'
-                      }`}
+            <>
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-zinc-500">
+                  共 {filteredRecords.length} 道错题，按 {recordGroups.length} 个知识点聚合
+                </p>
+                <span className="text-xs text-zinc-400">展开后可查看原题并重做</span>
+              </div>
+              <div className="mt-3 space-y-3">
+                {recordGroups.map((group) => {
+                  const expansionKey = `all:${group.key}`
+                  const open = expandedTask === expansionKey
+                  const redoRecords = group.records.filter(
+                    (record) => record.status === 'active',
+                  )
+                  return (
+                    <section
+                      key={group.key}
+                      className="rounded-lg border border-zinc-200 p-3.5"
                     >
-                      {STATUS_LABEL[record.status] ?? record.status}
-                    </span>
-                    <span className="text-zinc-500">
-                      错 {record.wrong_count} 次 · 下次 {formatDate(record.next_review_at)}
-                    </span>
-                  </div>
-                  <p className="mt-2 text-sm leading-6 text-zinc-800">{record.stem}</p>
-                  <p className="mt-1.5 text-xs leading-5 text-emerald-800">
-                    正确答案：{record.correct_answer_text}
-                  </p>
-                  {record.error_causes && record.error_causes.length > 0 && (
-                    <p className="mt-1.5 text-xs text-zinc-500">
-                      错因：{record.error_causes.join('、')}
-                    </p>
-                  )}
-                  {record.source_title && (
-                    <p className="mt-1.5 truncate text-xs text-zinc-500">来源：{record.source_title}</p>
-                  )}
-                  <button
-                    type="button"
-                    className="mt-2 inline-flex items-center gap-1 rounded-md bg-sky-600 px-2 py-1 text-xs font-semibold text-white transition hover:bg-sky-700"
-                    onClick={() =>
-                      onOpenExpression(
-                        record.topic,
-                        undefined,
-                        recordDocIds(record),
-                        'wrong_review',
-                        record.review_id,
-                      )
-                    }
-                  >
-                    <Mic className="size-3" aria-hidden="true" />
-                    去说一说
-                  </button>
-                </li>
-              ))}
-            </ul>
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="text-sm font-semibold text-zinc-900">{group.topic}</p>
+                            {group.activeCount > 0 && (
+                              <span className="rounded-md bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+                                待巩固 {group.activeCount}
+                              </span>
+                            )}
+                            {group.graduatedCount > 0 && (
+                              <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                已掌握 {group.graduatedCount}
+                              </span>
+                            )}
+                            {group.archivedCount > 0 && (
+                              <span className="rounded-md bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500">
+                                已移除 {group.archivedCount}
+                              </span>
+                            )}
+                          </div>
+                          <p className="mt-1 text-xs text-zinc-500">
+                            共 {group.records.length} 道 ·{' '}
+                            {group.typeCounts
+                              .map(
+                                (item) =>
+                                  `${TYPE_LABEL[item.type] ?? item.type} ${item.count}`,
+                              )
+                              .join(' · ')}
+                            {group.activeCount > 0 &&
+                              ` · 下次 ${
+                                group.nextReviewAt > 0
+                                  ? formatDate(group.nextReviewAt)
+                                  : '待排期'
+                              }`}
+                          </p>
+                          {group.sourceDocs.length > 0 && (
+                            <p className="mt-1 truncate text-xs text-zinc-500">
+                              来源：《{group.sourceDocs[0]}》
+                              {group.sourceDocs.length > 1
+                                ? ` 等 ${group.sourceDocs.length} 份`
+                                : ''}
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            className="secondary-btn px-3 py-2 text-xs"
+                            onClick={() =>
+                              setExpandedTask(open ? '' : expansionKey)
+                            }
+                            aria-expanded={open}
+                          >
+                            {open ? (
+                              <ChevronDown className="size-3.5" aria-hidden="true" />
+                            ) : (
+                              <ChevronRight className="size-3.5" aria-hidden="true" />
+                            )}
+                            {open ? '收起' : `展开 ${group.records.length} 道`}
+                          </button>
+                        </div>
+                      </div>
+
+                      {open && (
+                        <>
+                          <ul className="mt-4 space-y-3">
+                            {group.records.map((record) => (
+                              <li
+                                key={record.review_id}
+                                className="rounded-lg border border-zinc-200 bg-zinc-50 p-3.5"
+                              >
+                                <div className="flex flex-wrap items-center gap-2 text-xs">
+                                  <span className="rounded-md bg-white px-2 py-0.5 font-medium text-zinc-600 ring-1 ring-zinc-200">
+                                    {TYPE_LABEL[record.type] ?? record.type}
+                                  </span>
+                                  <span
+                                    className={`rounded-md px-2 py-0.5 font-medium ${
+                                      record.status === 'graduated'
+                                        ? 'bg-emerald-100 text-emerald-700'
+                                        : record.status === 'archived'
+                                          ? 'bg-zinc-100 text-zinc-500'
+                                          : 'bg-amber-100 text-amber-800'
+                                    }`}
+                                  >
+                                    {STATUS_LABEL[record.status] ?? record.status}
+                                  </span>
+                                  <span className="text-zinc-500">
+                                    错 {record.wrong_count} 次
+                                  </span>
+                                  {record.status === 'active' && (
+                                    <span className="text-zinc-500">
+                                      下次{' '}
+                                      {record.next_review_at > 0
+                                        ? formatDate(record.next_review_at)
+                                        : '待排期'}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="mt-2 text-sm leading-6 text-zinc-800">
+                                  {record.stem}
+                                </p>
+                                <p className="mt-1.5 text-xs leading-5 text-emerald-800">
+                                  正确答案：{record.correct_answer_text}
+                                </p>
+                                {record.error_causes && record.error_causes.length > 0 && (
+                                  <p className="mt-1.5 text-xs text-zinc-500">
+                                    错因：{record.error_causes.join('、')}
+                                  </p>
+                                )}
+                                {record.source_title && (
+                                  <p className="mt-1.5 truncate text-xs text-zinc-500">
+                                    来源：{record.source_title}
+                                  </p>
+                                )}
+                                <div className="mt-2 flex justify-end">
+                                  <button
+                                    type="button"
+                                    className="inline-flex items-center gap-1 rounded-md bg-sky-600 px-2 py-1 text-xs font-semibold text-white transition hover:bg-sky-700"
+                                    onClick={() =>
+                                      onOpenExpression(
+                                        record.topic,
+                                        undefined,
+                                        recordDocIds(record),
+                                        'wrong_review',
+                                        record.review_id,
+                                      )
+                                    }
+                                  >
+                                    <Mic className="size-3" aria-hidden="true" />
+                                    去说一说
+                                  </button>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                          {group.activeCount > 0 && (
+                            <div className="mt-3 rounded-lg bg-zinc-50 px-3 py-2">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <p className="text-xs leading-5 text-zinc-500">
+                                  重做使用组内待巩固原题；整组答对后推进复习间隔。
+                                </p>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <button
+                                    type="button"
+                                    className="primary-btn px-3 py-1.5 text-xs"
+                                    onClick={() =>
+                                      void handleRedoGroup(
+                                        group.topicId,
+                                        redoRecords.map(
+                                          (record) => record.review_id,
+                                        ),
+                                      )
+                                    }
+                                    disabled={
+                                      redoBusy === group.topicId ||
+                                      practiceBusy === group.topicId
+                                    }
+                                  >
+                                    {redoBusy === group.topicId ? (
+                                      <Loader2
+                                        className="size-3.5 animate-spin"
+                                        aria-hidden="true"
+                                      />
+                                    ) : (
+                                      <RotateCcw
+                                        className="size-3.5"
+                                        aria-hidden="true"
+                                      />
+                                    )}
+                                    {group.records.length === redoRecords.length
+                                      ? `重做这组 ${redoRecords.length} 道`
+                                      : `重做待巩固 ${redoRecords.length} 道`}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="secondary-btn px-3 py-1.5 text-xs"
+                                    onClick={() =>
+                                      void handlePractice(
+                                        group.topicId,
+                                        false,
+                                        true,
+                                      )
+                                    }
+                                    disabled={
+                                      practiceBusy === group.topicId ||
+                                      redoBusy === group.topicId
+                                    }
+                                  >
+                                    {practiceBusy === group.topicId ? (
+                                      <Loader2
+                                        className="size-3.5 animate-spin"
+                                        aria-hidden="true"
+                                      />
+                                    ) : (
+                                      <RefreshCw
+                                        className="size-3.5"
+                                        aria-hidden="true"
+                                      />
+                                    )}
+                                    换题再练 5 道
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </section>
+                  )
+                })}
+              </div>
+            </>
           )}
         </section>
       )}

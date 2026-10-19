@@ -27,8 +27,10 @@ import {
   requestTopQuestions,
   searchKnowledge,
   synthesiseSpeech,
+  transcribeExpressionClip,
 } from '../api'
 import type { TTSVoice } from '../api'
+import { useAnswerRecorder } from '../hooks/useAnswerRecorder'
 import { useSpeech } from '../hooks/useSpeech'
 import type {
   InterviewAnswerResponse,
@@ -58,6 +60,36 @@ const ROLE_ICONS: Record<string, typeof Bot> = {
 
 const ROLE_STORAGE_KEY = 'opc-interview-role'
 
+const VOICE_PREVIEW_TEMPLATES: Array<(targetName: string) => string> = [
+  (targetName) =>
+    `你好，我是今天的面试官。本场面试的是${targetName}，请先花两三分钟做个自我介绍，重点说说你最近负责的相关项目。`,
+  (targetName) =>
+    `你好，我是负责${targetName}的面试官。我们先从项目经历开始，请介绍一个最能体现你能力的项目。`,
+  (targetName) =>
+    `你好，欢迎参加${targetName}的面试。请先简短介绍自己，重点说说你在相关项目里的职责和量化结果。`,
+  (targetName) =>
+    `你好，我是今天的面试官，接下来会围绕${targetName}展开提问。请先做一个简短的自我介绍。`,
+]
+
+function nextPreviewTemplateIndex(previous: number): number {
+  if (VOICE_PREVIEW_TEMPLATES.length < 2) return 0
+  const picked = Math.floor(Math.random() * VOICE_PREVIEW_TEMPLATES.length)
+  return picked === previous
+    ? (picked + 1) % VOICE_PREVIEW_TEMPLATES.length
+    : picked
+}
+
+function buildVoicePreviewText(
+  roleName: string,
+  company: string,
+  templateIndex: number,
+): string {
+  const targetName = company.trim()
+    ? `${company.trim()}的${roleName}岗位`
+    : `${roleName}岗位`
+  return VOICE_PREVIEW_TEMPLATES[templateIndex](targetName)
+}
+
 function buildTranscript(messages: InterviewMessage[]): string {
   return messages
     .map(
@@ -65,6 +97,12 @@ function buildTranscript(messages: InterviewMessage[]): string {
         `${message.role === 'interviewer' ? '面试官' : '候选人'}：${message.content}`,
     )
     .join('\n')
+}
+
+function formatDuration(seconds: number): string {
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  return `${minutes}:${String(rest).padStart(2, '0')}`
 }
 
 export function MockInterview({
@@ -84,9 +122,12 @@ export function MockInterview({
   )
   const [voiceMode, setVoiceMode] = useState(true)
   const [voices, setVoices] = useState<TTSVoice[]>([])
+  const [voiceLoading, setVoiceLoading] = useState(true)
+  const [voiceListError, setVoiceListError] = useState('')
   const [voiceId, setVoiceId] = useState('')
   const [speechRate, setSpeechRate] = useState(0)
   const [previewing, setPreviewing] = useState(false)
+  const [previewScript, setPreviewScript] = useState('')
   const [messages, setMessages] = useState<InterviewMessage[]>([])
   const [askedCount, setAskedCount] = useState(0)
   const [isThinking, setIsThinking] = useState(false)
@@ -101,6 +142,8 @@ export function MockInterview({
   const [expandedTop, setExpandedTop] = useState<number | null>(null)
   const [answerData, setAnswerData] = useState<InterviewAnswerResponse | null>(null)
   const [answerLoading, setAnswerLoading] = useState(false)
+  const [finalizingAnswer, setFinalizingAnswer] = useState(false)
+  const [transcribingFallback, setTranscribingFallback] = useState(false)
   const knowledgeRef = useRef('')
   const scrollRef = useRef<HTMLDivElement | null>(null)
   // 生成题目提纲时，用户可能切换岗位或题量；用世代号让旧请求的结果自动作废。
@@ -110,39 +153,59 @@ export function MockInterview({
   const previewAudioRef = useRef<HTMLAudioElement | null>(null)
   const previewUrlRef = useRef('')
   const previewTokenRef = useRef(0)
+  const previewResolveRef = useRef<(() => void) | null>(null)
+  const previewAbortRef = useRef<AbortController | null>(null)
+  const previewTemplateRef = useRef(-1)
   // 一轮对话的世代号。切换岗位或重新开始面试时自增，
   // 让仍在途中的上一岗位请求返回后自行作废。
   const turnTokenRef = useRef(0)
+  const effectiveVoiceId = voiceId || voices[0]?.id || ''
 
   const {
     isListening,
     isSpeaking,
     interimText,
     speechError,
+    voiceError,
     recognitionSupported,
     usingFallbackVoice,
     startListening,
     stopListening,
+    finishListening,
     speak,
     stopSpeaking,
     warmUpOutput,
-  } = useSpeech({ lang: 'zh-CN', voice: voiceId, rate: speechRate })
+  } = useSpeech({ lang: 'zh-CN', voice: effectiveVoiceId, rate: speechRate })
 
-  useEffect(() => {
-    let cancelled = false
-    listTTSVoices()
-      .then((data) => {
-        if (cancelled) return
-        setVoices(data.voices)
-        setVoiceId((current) => current || data.default)
-      })
-      .catch(() => {
-        // 取不到音色列表时沿用后端默认值，不打断面试流程。
-      })
-    return () => {
-      cancelled = true
+  const {
+    isRecording,
+    elapsedSeconds: recordingSeconds,
+    level: recordingLevel,
+    error: recorderError,
+    startRecording,
+    stopRecording,
+    cancelRecording,
+  } = useAnswerRecorder()
+
+  const loadVoices = useCallback(async () => {
+    setVoiceLoading(true)
+    setVoiceListError('')
+    try {
+      const data = await listTTSVoices()
+      setVoices(data.voices)
+      setVoiceId((current) => current || data.default || data.voices[0]?.id || '')
+    } catch (error) {
+      setVoiceListError(
+        error instanceof Error ? error.message : '音色列表加载失败，请重试。',
+      )
+    } finally {
+      setVoiceLoading(false)
     }
   }, [])
+
+  useEffect(() => {
+    void loadVoices()
+  }, [loadVoices])
 
   useEffect(() => {
     let cancelled = false
@@ -179,6 +242,11 @@ export function MockInterview({
       URL.revokeObjectURL(previewUrlRef.current)
       previewUrlRef.current = ''
     }
+    const resolvePreview = previewResolveRef.current
+    previewResolveRef.current = null
+    resolvePreview?.()
+    previewAbortRef.current?.abort()
+    previewAbortRef.current = null
     setPreviewing(false)
   }, [])
 
@@ -190,8 +258,11 @@ export function MockInterview({
       // 切岗位要立刻掐掉上一岗位还在播或还在合成的语音，避免两个岗位的声音叠在一起。
       turnTokenRef.current += 1
       stopPreview()
+      setPreviewScript('')
       stopSpeaking()
       stopListening()
+      cancelRecording()
+      setTranscribingFallback(false)
       setIsThinking(false)
       topAbortRef.current?.abort()
       topAbortRef.current = null
@@ -207,7 +278,7 @@ export function MockInterview({
       // 这样正式播报时不用再等声卡冷启动。
       void warmUpOutput()
     },
-    [roleKey, stopListening, stopPreview, stopSpeaking, warmUpOutput],
+    [roleKey, cancelRecording, stopListening, stopPreview, stopSpeaking, warmUpOutput],
   )
 
   const activeRole = roleOptions.find((item) => item.key === roleKey)
@@ -232,7 +303,15 @@ export function MockInterview({
       top: scrollRef.current.scrollHeight,
       behavior: 'smooth',
     })
-  }, [messages, interimText, isThinking])
+  }, [
+    messages,
+    interimText,
+    isThinking,
+    isListening,
+    isRecording,
+    finalizingAnswer,
+    transcribingFallback,
+  ])
 
   const runTurn = useCallback(
     async (history: InterviewMessage[], asked: number) => {
@@ -267,14 +346,17 @@ export function MockInterview({
 
         if (voiceMode) {
           // 播报期间必须停止识别，否则会把面试官的声音识别成候选人的回答。
-          await speak(turn.speech)
+          await speak(turn.speech, effectiveVoiceId)
         }
         if (token !== turnTokenRef.current) return
         if (turn.is_final) {
           setIsDone(true)
           return
         }
-        if (voiceMode && recognitionSupported) startListening()
+        if (voiceMode && recognitionSupported) {
+          void startRecording()
+          startListening()
+        }
       } catch (turnError) {
         if (token !== turnTokenRef.current) return
         setIsThinking(false)
@@ -291,52 +373,108 @@ export function MockInterview({
       maxQuestions,
       topQuestions,
       roleKey,
+      effectiveVoiceId,
       voiceMode,
       recognitionSupported,
+      startRecording,
       speak,
       startListening,
     ],
   )
 
-  const activeVoice = voices.find((item) => item.id === voiceId)
+  const activeVoice = voices.find((item) => item.id === effectiveVoiceId)
+  const outlineReady = topQuestions?.length === maxQuestions
 
   const handlePreviewVoice = async () => {
     if (previewing) return
+    const selectedVoice = effectiveVoiceId
+    if (!selectedVoice) {
+      setError('音色列表尚未加载，请稍后重试。')
+      return
+    }
+    const roleName = activeRole?.name?.trim() || '当前意向岗位'
+    const templateIndex = nextPreviewTemplateIndex(previewTemplateRef.current)
+    previewTemplateRef.current = templateIndex
+    const previewText = buildVoicePreviewText(roleName, company, templateIndex)
+    setPreviewScript(previewText)
     // 试听和面试官播报共用扬声器，先把正在进行的播报停掉。
     stopSpeaking()
     stopPreview()
     const token = previewTokenRef.current
+    const controller = new AbortController()
+    previewAbortRef.current = controller
     setPreviewing(true)
     setError('')
+    // 趁点击手势仍然有效，先把输出设备唤醒；等待合成后再建 AudioContext 可能被浏览器挂起。
+    void warmUpOutput()
     try {
-      const blob = await synthesiseSpeech({
-        text: '你好，我是今天的面试官。请先花两三分钟做个自我介绍，重点说说你最近负责的测试项目。',
-        voice: voiceId,
-        rate: speechRate,
-      })
+      const blob = await synthesiseSpeech(
+        {
+          text: previewText,
+          voice: selectedVoice,
+          rate: speechRate,
+        },
+        controller.signal,
+      )
       if (token !== previewTokenRef.current) return
+      if (!blob.size) throw new Error('语音服务返回了空音频，请稍后重试。')
       const url = URL.createObjectURL(blob)
       previewUrlRef.current = url
       const audio = new Audio(url)
+      audio.preload = 'auto'
       previewAudioRef.current = audio
-      await new Promise<void>((resolve) => {
-        audio.onended = () => resolve()
-        audio.onerror = () => resolve()
-        audio.play().catch(() => resolve())
+      await warmUpOutput()
+      if (token !== previewTokenRef.current) return
+      await new Promise<void>((resolve, reject) => {
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          if (previewResolveRef.current === finish) previewResolveRef.current = null
+          resolve()
+        }
+        const fail = (error: Error) => {
+          if (settled) return
+          settled = true
+          if (previewResolveRef.current === finish) previewResolveRef.current = null
+          reject(error)
+        }
+        previewResolveRef.current = finish
+        audio.onended = finish
+        audio.onerror = () =>
+          fail(new Error('试听音频加载失败，请检查网络后重试。'))
+        audio.play().catch((error: unknown) => {
+          const blocked =
+            typeof error === 'object' &&
+            error !== null &&
+            'name' in error &&
+            (error as { name?: unknown }).name === 'NotAllowedError'
+          fail(
+            new Error(
+              blocked
+                ? '浏览器阻止了试听播放，请再点一次“试听”或检查系统音量。'
+                : '试听播放失败，请检查系统音量和输出设备。',
+            ),
+          )
+        })
       })
       if (token !== previewTokenRef.current) return
       previewAudioRef.current = null
       previewUrlRef.current = ''
       URL.revokeObjectURL(url)
     } catch (previewError) {
-      if (token !== previewTokenRef.current) return
+      if (token !== previewTokenRef.current || isAbortError(previewError)) return
       setError(
         previewError instanceof Error
           ? previewError.message
           : '试听失败，请检查网络后重试。',
       )
     } finally {
-      if (token === previewTokenRef.current) setPreviewing(false)
+      if (token === previewTokenRef.current) {
+        previewResolveRef.current = null
+        if (previewAbortRef.current === controller) previewAbortRef.current = null
+        setPreviewing(false)
+      }
     }
   }
 
@@ -345,6 +483,8 @@ export function MockInterview({
     turnTokenRef.current += 1
     stopPreview()
     stopSpeaking()
+    cancelRecording()
+    setTranscribingFallback(false)
     void warmUpOutput()
     setStarted(true)
     setMessages([])
@@ -393,6 +533,7 @@ export function MockInterview({
       .reverse()
       .find((message) => message.role === 'candidate')?.content
     stopListening()
+    cancelRecording()
     setAnswerData(null)
     setAnswerLoading(true)
     setError('')
@@ -506,21 +647,58 @@ export function MockInterview({
   }
 
   const handleVoiceSubmit = async () => {
-    const text = stopListening()
-    if (!text) {
-      setError('没有听到内容，请再说一次或改用打字回答。')
-      return
+    if (finalizingAnswer || isThinking) return
+    setFinalizingAnswer(true)
+    setError('')
+    const recordingPromise = stopRecording()
+    let text = ''
+    try {
+      text = await finishListening()
+    } catch {
+      // finishListening 正常情况下不会抛错；即使收尾失败也继续走录音兜底。
     }
+    if (!text) {
+      setTranscribingFallback(true)
+      try {
+        const blob = await recordingPromise
+        if (!blob || blob.size === 0) {
+          throw new Error(
+            '没有录到音频。请确认麦克风已开启、浏览器使用的是正确的输入设备，或改用打字回答。',
+          )
+        }
+        const result = await transcribeExpressionClip(blob)
+        text = result.text.trim()
+      } catch (fallbackError) {
+        setError(
+          fallbackError instanceof Error
+            ? fallbackError.message
+            : '录音转写失败，请重试或改用打字回答。',
+        )
+      } finally {
+        setTranscribingFallback(false)
+      }
+    } else {
+      // 实时识别已经有文字时也要等录音器收尾，及时释放麦克风轨道。
+      await recordingPromise.catch(() => null)
+    }
+    setFinalizingAnswer(false)
+    if (!text) return
     await submitAnswer(text)
   }
 
   const handleFinish = () => {
     stopListening()
+    cancelRecording()
     stopSpeaking()
     onFinished(buildTranscript(messages))
   }
 
-  const activeError = error || speechError
+  const handleStartAnswer = () => {
+    void startRecording()
+    startListening()
+  }
+
+  const activeError = error || speechError || voiceError
 
   if (!started) {
     return (
@@ -630,7 +808,7 @@ export function MockInterview({
           语音模式（面试官朗读问题，你用麦克风回答）
         </label>
 
-        {voiceMode && voices.length > 0 && (
+        {voiceMode && (
           <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-4">
             <div className="flex flex-wrap items-end gap-3">
               <div className="min-w-0 flex-1">
@@ -643,22 +821,32 @@ export function MockInterview({
                 <select
                   id="interviewer-voice"
                   className="mt-1.5 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-800"
-                  value={voiceId}
+                  value={effectiveVoiceId}
                   onChange={(event) => setVoiceId(event.target.value)}
+                  disabled={voiceLoading || voices.length === 0}
                 >
-                  {voices.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.label}
+                  {voices.length > 0 ? (
+                    voices.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.label}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">
+                      {voiceLoading ? '正在加载音色...' : '音色列表加载失败'}
                     </option>
-                  ))}
+                  )}
                 </select>
+                {voiceListError && (
+                  <p className="mt-1 text-xs leading-5 text-red-600">{voiceListError}</p>
+                )}
               </div>
               <button
                 type="button"
                 className="secondary-btn px-3 py-2"
                 onClick={handlePreviewVoice}
-                disabled={previewing}
-                title="试听当前音色"
+                disabled={previewing || voiceLoading || !effectiveVoiceId}
+                title={effectiveVoiceId ? '试听当前音色' : '音色尚未加载'}
               >
                 {previewing ? (
                   <Loader2 className="size-4 animate-spin" aria-hidden="true" />
@@ -670,7 +858,37 @@ export function MockInterview({
             </div>
 
             {activeVoice && (
-              <p className="mt-2 text-xs text-zinc-500">{activeVoice.desc}</p>
+              <p className="mt-2 text-xs text-zinc-500">
+                {activeVoice.desc}。试听和正式面试都使用当前选中的音色；试听内容会随意向岗位变化。
+              </p>
+            )}
+
+            {previewScript && (
+              <p className="mt-2 rounded-lg bg-white px-3 py-2 text-xs leading-5 text-zinc-600 ring-1 ring-zinc-200">
+                <span className="font-medium text-zinc-500">试听文案：</span>
+                {previewScript}
+              </p>
+            )}
+
+            {previewing && (
+              <p
+                role="status"
+                aria-live="polite"
+                className="mt-2 flex items-center gap-1.5 text-xs text-emerald-700"
+              >
+                <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                正在试听 {activeVoice?.label ?? '当前音色'}...
+              </p>
+            )}
+
+            {voiceListError && !voiceLoading && (
+              <button
+                type="button"
+                className="mt-2 text-xs font-semibold text-emerald-700 underline underline-offset-2"
+                onClick={() => void loadVoices()}
+              >
+                重新加载音色
+              </button>
             )}
 
             <div className="mt-3">
@@ -704,7 +922,7 @@ export function MockInterview({
         <div className="mt-4">
           <button
             type="button"
-            className="secondary-btn w-full py-2.5"
+            className={`${outlineReady ? 'secondary-btn' : 'primary-btn'} w-full py-2.5`}
             onClick={handleGenerateTopQuestions}
             disabled={topLoading}
           >
@@ -714,11 +932,15 @@ export function MockInterview({
               <ListChecks className="size-4" aria-hidden="true" />
             )}
             {topLoading
-              ? `正在生成第 ${topProgress?.current ?? 1}/${topProgress?.total ?? maxQuestions} 道`
-              : '生成本场题目提纲'}
+              ? `生成中 ${topProgress?.current ?? 1}/${topProgress?.total ?? maxQuestions}`
+              : outlineReady
+                ? '重新生成'
+                : '生成提纲'}
           </button>
           <p className="mt-2 text-xs leading-5 text-zinc-500">
-            按上方题量逐道生成，生成后模拟面试会按这份提纲顺序提问。
+            {outlineReady
+              ? '如需调整题目，可以重新生成一份提纲。'
+              : '按上方题量生成完整提纲后，才能开始面试。'}
           </p>
         </div>
 
@@ -761,8 +983,7 @@ export function MockInterview({
             </p>
             {topQuestions.length < maxQuestions && !topLoading && (
               <p className="mt-1 text-xs leading-5 text-amber-700">
-                提纲未生成完整，缺少 {maxQuestions - topQuestions.length} 道；可以重新生成，
-                未完整时面试官会自由提问。
+                提纲未生成完整，缺少 {maxQuestions - topQuestions.length} 道；请重新生成完整提纲后再开始面试。
               </p>
             )}
             <ol className="mt-3 space-y-2">
@@ -809,13 +1030,21 @@ export function MockInterview({
 
         <button
           type="button"
-          className="primary-btn mt-5 w-full py-3"
+          className={`${outlineReady ? 'primary-btn' : 'secondary-btn'} mt-5 w-full py-3`}
           onClick={handleStart}
-          disabled={topLoading}
+          disabled={topLoading || !outlineReady}
+          title={outlineReady ? '按上方提纲开始面试' : '请先生成完整提纲'}
         >
           <Mic className="size-5" aria-hidden="true" />
-          {topQuestions?.length === maxQuestions ? '开始模拟面试（按提纲）' : '开始模拟面试'}
+          开始面试
         </button>
+        <p
+          className={`mt-2 text-center text-xs leading-5 ${
+            outlineReady ? 'text-emerald-700' : 'text-zinc-500'
+          }`}
+        >
+          {outlineReady ? '将按上方提纲顺序提问' : '请先生成完整提纲，再开始面试'}
+        </p>
       </section>
     )
   }
@@ -893,11 +1122,35 @@ export function MockInterview({
           </div>
         ))}
 
-        {interimText && (
+        {(isListening || isRecording || finalizingAnswer || transcribingFallback) && (
           <div className="flex justify-end">
-            <p className="max-w-[85%] rounded-lg border border-dashed border-emerald-300 bg-white px-3 py-2 text-sm leading-6 text-zinc-500">
-              {interimText}
-            </p>
+            <div className="max-w-[85%] rounded-lg border border-dashed border-emerald-300 bg-white px-3 py-2 text-sm leading-6 text-zinc-700">
+              <p className="flex items-center gap-1.5 text-xs font-medium text-emerald-700">
+                <span className="relative flex size-2">
+                  {(isRecording || isListening) && (
+                    <span className="absolute inline-flex size-full animate-ping rounded-full bg-red-400 opacity-75" />
+                  )}
+                  <span
+                    className={`relative inline-flex size-2 rounded-full ${
+                      isRecording || isListening ? 'bg-red-500' : 'bg-amber-500'
+                    }`}
+                  />
+                </span>
+                {transcribingFallback
+                  ? '正在录音转写'
+                  : finalizingAnswer
+                    ? '正在整理回答'
+                    : '候选人实时转写'}
+              </p>
+              <p className="mt-1 whitespace-pre-wrap">
+                {interimText ||
+                  (transcribingFallback
+                    ? '浏览器没有返回实时文字，正在用录音转写…'
+                    : isRecording
+                      ? '正在收音，请说话…'
+                      : '正在等待语音…')}
+              </p>
+            </div>
           </div>
         )}
 
@@ -908,6 +1161,18 @@ export function MockInterview({
           </div>
         )}
       </div>
+
+      {usingFallbackVoice && (
+        <p
+          role="status"
+          className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"
+        >
+          <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          <span>
+            所选神经音色暂时不可用，当前已回退到浏览器内置语音。请检查网络后重新试听或重试。
+          </span>
+        </p>
+      )}
 
       {activeError && (
         <p className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
@@ -966,23 +1231,80 @@ export function MockInterview({
             </div>
           )}
 
+          {(isListening || isRecording || finalizingAnswer || transcribingFallback) && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="rounded-lg border border-emerald-200 bg-emerald-50 p-3"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <span className="flex items-center gap-2 text-sm font-semibold text-emerald-900">
+                  <span className="relative flex size-2.5">
+                    {(isRecording || isListening) && (
+                      <span className="absolute inline-flex size-full animate-ping rounded-full bg-red-400 opacity-75" />
+                    )}
+                    <span
+                      className={`relative inline-flex size-2.5 rounded-full ${
+                        isRecording || isListening ? 'bg-red-500' : 'bg-amber-500'
+                      }`}
+                    />
+                  </span>
+                  {transcribingFallback
+                    ? '正在录音转写'
+                    : finalizingAnswer
+                      ? '正在整理回答'
+                      : isRecording
+                        ? '正在录音'
+                        : '正在等待语音'}
+                </span>
+                <span className="text-xs font-medium text-emerald-800">
+                  {formatDuration(recordingSeconds)}
+                </span>
+              </div>
+              <div className="mt-2 h-2 overflow-hidden rounded-full bg-white">
+                <div
+                  className="h-full rounded-full bg-emerald-500 transition-[width] duration-100"
+                  style={{ width: `${Math.round(recordingLevel * 100)}%` }}
+                />
+              </div>
+              <p className="mt-2 text-xs leading-5 text-emerald-900">
+                {transcribingFallback
+                  ? '正在用本地录音转写，通常需要 5-20 秒。'
+                  : isRecording
+                    ? '麦克风正在收音。实时文字会显示在上方对话区；如果一直没有文字，点击“回答完毕”会自动用录音转写。'
+                    : isListening
+                      ? '正在等待麦克风启动；如果浏览器弹出权限请求，请选择允许。'
+                      : '正在等待语音...'}
+              </p>
+              {recorderError && (
+                <p className="mt-1 text-xs leading-5 text-amber-700">
+                  录音兜底不可用：{recorderError}
+                </p>
+              )}
+            </div>
+          )}
+
           {voiceMode && recognitionSupported ? (
             <div className="flex flex-wrap items-center gap-3">
-              {isListening ? (
+              {isListening || isRecording || finalizingAnswer ? (
                 <button
                   type="button"
                   className="primary-btn"
                   onClick={handleVoiceSubmit}
-                  disabled={isThinking}
+                  disabled={isThinking || finalizingAnswer}
                 >
-                  <Square className="size-4" aria-hidden="true" />
-                  回答完毕
+                  {finalizingAnswer ? (
+                    <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Square className="size-4" aria-hidden="true" />
+                  )}
+                  {finalizingAnswer ? '正在整理回答' : '回答完毕'}
                 </button>
               ) : (
                 <button
                   type="button"
                   className="secondary-btn"
-                  onClick={startListening}
+                  onClick={handleStartAnswer}
                   disabled={isThinking || isSpeaking}
                 >
                   <Mic className="size-4" aria-hidden="true" />
@@ -990,10 +1312,20 @@ export function MockInterview({
                 </button>
               )}
               <span className="flex items-center gap-1.5 text-xs text-zinc-500">
-                {isListening ? (
+                {finalizingAnswer ? (
+                  <>
+                    <Loader2 className="size-3.5 animate-spin text-emerald-600" aria-hidden="true" />
+                    正在整理最后一段语音
+                  </>
+                ) : isListening ? (
                   <>
                     <Mic className="size-3.5 text-red-500" aria-hidden="true" />
                     麦克风开启中
+                  </>
+                ) : isRecording ? (
+                  <>
+                    <Mic className="size-3.5 text-red-500" aria-hidden="true" />
+                    正在录音，实时识别未开启
                   </>
                 ) : (
                   <>

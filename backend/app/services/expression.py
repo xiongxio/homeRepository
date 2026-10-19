@@ -43,6 +43,7 @@ GENERATED_QUESTION_CACHE_DIR = settings.data_dir / "expression" / "generated_que
 GENERATED_QUESTION_CACHE_VERSION = "generated-questions-v1"
 GENERATED_QUESTION_TTL_SECONDS = 7 * 24 * 3600
 EXPRESSION_GENERATE_FAST_WAIT_SECONDS = 6.0
+EXPRESSION_KNOWLEDGE_FAST_WAIT_SECONDS = 2.0
 EXPRESSION_MISTAKE_FAST_WAIT_SECONDS = 6.0
 EXPRESSION_MISTAKE_MAX_RECORDS = 12
 MISTAKE_REWRITE_VERSION = "spoken-v2"
@@ -55,6 +56,7 @@ _SPEAKING_JOBS: set[str] = set()
 _SPEAKING_WORK_LIMIT = threading.Semaphore(2)
 _GENERATION_JOBS_LOCK = threading.Lock()
 _PENDING_GENERATIONS: dict[str, Queue] = {}
+_GENERATION_FAILURES: dict[str, dict] = {}
 _KNOWLEDGE_POOL_LOCK = threading.Lock()
 
 # 纯粹的语气词，出现即扣分。
@@ -689,6 +691,37 @@ def _wait_for_generated_question(queue: Queue, timeout: float) -> dict | None:
     return result if isinstance(result, dict) else None
 
 
+def _is_generation_pending(cache_key: str) -> bool:
+    with _GENERATION_JOBS_LOCK:
+        return cache_key in _PENDING_GENERATIONS
+
+
+def _generation_failure(cache_key: str) -> str:
+    with _GENERATION_JOBS_LOCK:
+        item = _GENERATION_FAILURES.get(cache_key)
+        if not item:
+            return ""
+        if int(time.time()) - int(item.get("at") or 0) > 600:
+            _GENERATION_FAILURES.pop(cache_key, None)
+            return ""
+        return str(item.get("error") or "")
+
+
+def _remember_generation_failure(cache_key: str, error: str) -> None:
+    with _GENERATION_JOBS_LOCK:
+        _GENERATION_FAILURES[cache_key] = {
+            "error": error,
+            "at": int(time.time()),
+        }
+        if len(_GENERATION_FAILURES) > 100:
+            expired = sorted(
+                _GENERATION_FAILURES.items(),
+                key=lambda pair: int(pair[1].get("at") or 0),
+            )[:20]
+            for key, _ in expired:
+                _GENERATION_FAILURES.pop(key, None)
+
+
 def _get_or_start_generation(
     cache_key: str,
     role_name: str,
@@ -701,18 +734,29 @@ def _get_or_start_generation(
         pending = _PENDING_GENERATIONS.get(cache_key)
         if pending:
             return pending
+        _GENERATION_FAILURES.pop(cache_key, None)
         queue: Queue = Queue(maxsize=1)
         _PENDING_GENERATIONS[cache_key] = queue
 
     def worker() -> None:
-        result = (generator or _generate_question_via_llm)(
-            role_name,
-            topic_hint,
-            chunks,
-            question_type,
-        )
+        error = ""
+        try:
+            result = (generator or _generate_question_via_llm)(
+                role_name,
+                topic_hint,
+                chunks,
+                question_type,
+            )
+        except Exception as exc:
+            result = None
+            error = str(exc).strip() or "模型没有返回可用的表达题。"
         if result:
             _save_generated_question(cache_key, result)
+        else:
+            _remember_generation_failure(
+                cache_key,
+                error or "模型没有返回可用的表达题，请检查模型配置后重试。",
+            )
         try:
             queue.put_nowait(result)
         except Exception:
@@ -1078,9 +1122,9 @@ def _generate_question_via_llm(
     question_type: str = "",
     existing_questions: list[str] | None = None,
 ) -> dict | None:
-    """调用 LLM 根据原文片段生成一道表达练习题，失败返回 None。"""
+    """调用 LLM 根据原文片段生成一道表达练习题；失败时抛出可读错误。"""
     if not chunks:
-        return None
+        raise ExpressionError("所选知识库文档没有可用的原文片段。")
     try:
         raw = llm_service.chat_json(
             prompts.EXPRESSION_GENERATE_SYSTEM,
@@ -1094,14 +1138,22 @@ def _generate_question_via_llm(
             max_tokens=1200,
             timeout=EXPRESSION_GENERATE_TIMEOUT_SECONDS,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        message = str(exc).strip() or "模型调用失败。"
+        if message.startswith("LLM_UPSTREAM: "):
+            message = message[len("LLM_UPSTREAM: ") :]
+        lowered = message.lower()
+        if "timed out" in lowered or "timeout" in lowered:
+            message = (
+                "模型响应超时，请稍后重试，或在模型配置中切换到更快的模型。"
+            )
+        raise ExpressionError(f"表达题生成失败：{message}") from exc
     if not isinstance(raw, dict):
-        return None
+        raise ExpressionError("模型返回的表达题格式不正确，请稍后重试。")
     question = str(raw.get("question") or "").strip()
     reference_answer = str(raw.get("reference_answer") or "").strip()
     if not question or not reference_answer:
-        return None
+        raise ExpressionError("模型返回的题目缺少题干或参考答案，请稍后重试。")
     keywords = [str(item).strip() for item in (raw.get("keywords") or []) if str(item).strip()]
     key_points = [
         str(item).strip()
@@ -1118,6 +1170,45 @@ def _generate_question_via_llm(
         "reference_script": reference_script,
         "source_title": source_title,
         "question_type": question_type,
+    }
+
+
+def _knowledge_pending_response(
+    role,
+    source: str,
+    source_ref: str,
+    question_type: str,
+    nonce: str,
+) -> dict:
+    """知识库题目仍在后台生成时返回的占位响应，前端按同一 nonce 轮询。"""
+    return {
+        "question": "",
+        "label": "",
+        "source": "",
+        "section": "",
+        "topic_matched": False,
+        "generated_by_llm": False,
+        "generation_pending": True,
+        "pending_token": nonce,
+        "retry_after_ms": 1500,
+        "disclaimer": "正在从所选知识库文档生成表达题，完成后会自动显示。",
+        "reference_answer": "",
+        "keywords": [],
+        "standard_key_points": [],
+        "reference_script": "",
+        "source_tag": source or "knowledge",
+        "source_type": "knowledge",
+        "source_ref": source_ref,
+        "question_type": question_type,
+        "source_title": "",
+        "role_key": role.key,
+        "role_name": role.name,
+        "pool_questions": [],
+        "pool_index": 0,
+        "pool_limit": KNOWLEDGE_POOL_LIMIT,
+        "pool_remaining": 0,
+        "pool_exhausted": False,
+        "pool_message": "",
     }
 
 
@@ -1224,6 +1315,10 @@ def drill_question(
             if isinstance(item, dict) and isinstance(item.get("payload"), dict)
         ]
 
+        failure = _generation_failure(cache_key)
+        if failure:
+            raise ExpressionError(failure)
+
         def knowledge_generator(role_name, topic, source_chunks, qtype):
             return _generate_question_via_llm(
                 "",
@@ -1245,13 +1340,23 @@ def drill_question(
             )
             generated_payload = _wait_for_generated_question(
                 generated_queue,
-                EXPRESSION_GENERATE_FAST_WAIT_SECONDS,
+                EXPRESSION_KNOWLEDGE_FAST_WAIT_SECONDS,
             )
             if generated_payload:
                 _save_generated_question(cache_key, generated_payload)
         if not generated_payload:
+            if _is_generation_pending(cache_key):
+                return _knowledge_pending_response(
+                    role,
+                    source,
+                    generated_source_ref,
+                    question_type,
+                    nonce,
+                )
+            failure = _generation_failure(cache_key)
             raise ExpressionError(
-                "暂时无法从所选知识库文档生成表达题，请稍后重试。"
+                failure
+                or "暂时无法从所选知识库文档生成表达题，请检查模型配置后重试。"
             )
 
         _prefetch_speaking_materials(

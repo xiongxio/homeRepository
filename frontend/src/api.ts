@@ -505,9 +505,26 @@ export async function getActiveResume(): Promise<ResumeRecord | null> {
   return apiFetch<ResumeRecord | null>('/resume/active')
 }
 
-export async function generateResumeAdvice(refresh = false): Promise<ResumeAdvice> {
-  return apiFetch<ResumeAdvice>(`/resume/active/advice${refresh ? '?refresh=true' : ''}`, {
+export async function generateResumeAdvice(
+  context: {
+    company?: string
+    target_role?: string
+    jd?: string
+    refresh?: boolean
+  } = {},
+): Promise<ResumeAdvice> {
+  const params = new URLSearchParams()
+  if (context.refresh) params.set('refresh', 'true')
+  const query = params.toString()
+  return apiFetch<ResumeAdvice>(`/resume/active/advice${query ? `?${query}` : ''}`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      company: context.company ?? '',
+      target_role: context.target_role ?? '',
+      jd: context.jd ?? '',
+      refresh: Boolean(context.refresh),
+    }),
   })
 }
 
@@ -642,11 +659,29 @@ export async function saveReviewErrorCause(
 export async function generateReviewPractice(
   topicId: string,
   includeToday = false,
+  includeActive = false,
 ): Promise<QuizPaper> {
-  const query = includeToday ? '?include_today=true' : ''
+  const params = new URLSearchParams()
+  if (includeToday) params.set('include_today', 'true')
+  if (includeActive) params.set('include_active', 'true')
+  const query = params.size > 0 ? `?${params.toString()}` : ''
   return apiFetch<QuizPaper>(
     `/quiz/review/tasks/${encodeURIComponent(topicId)}/practice${query}`,
     { method: 'POST' },
+  )
+}
+
+export async function generateReviewRedo(
+  topicId: string,
+  reviewIds: string[],
+): Promise<QuizPaper> {
+  return apiFetch<QuizPaper>(
+    `/quiz/review/tasks/${encodeURIComponent(topicId)}/redo`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ review_ids: reviewIds }),
+    },
   )
 }
 
