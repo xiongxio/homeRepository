@@ -375,5 +375,82 @@ class ReviewScheduleTests(unittest.TestCase):
             expression_service.EXPRESSION_GENERATE_FAST_WAIT_SECONDS = originals["fast_wait"]
 
 
+    def test_today_new_wrong_answer_is_visible_and_practicable(self):
+        question = self._question()
+        review_service.sync_wrong_answers([question], self._paper([question]))
+
+        dashboard = review_service.get_dashboard()
+        self.assertEqual(1, dashboard["today_new_count"])
+        self.assertEqual(0, dashboard["due_count"])
+        self.assertEqual(1, len(dashboard["today_tasks"]))
+        self.assertEqual("rag分块", dashboard["today_tasks"][0]["topic_id"])
+
+        with self.assertRaises(review_service.ReviewError):
+            review_service.generate_practice_paper("rag分块")
+
+        fake_paper = {
+            **self._paper([question]),
+            "paper_id": "generated_today_review_paper",
+        }
+        with (
+            patch(
+                "backend.app.services.knowledge.list_documents",
+                return_value=[{"doc_id": "doc_rag", "title": "RAG 讲义"}],
+            ),
+            patch(
+                "backend.app.services.quiz.generate_paper",
+                return_value=fake_paper,
+            ) as fake_generate,
+        ):
+            paper = review_service.generate_practice_paper(
+                "rag分块",
+                include_today=True,
+            )
+
+        self.assertEqual("generated_today_review_paper", paper["paper_id"])
+        self.assertTrue(paper["generation_context"]["include_today"])
+        self.assertEqual(1, len(paper["generation_context"]["review_ids"]))
+        fake_generate.assert_called_once()
+
+    def test_today_new_leaves_after_pass_and_stays_after_fail(self):
+        question = self._question()
+        review_service.sync_wrong_answers([question], self._paper([question]))
+        self.assertEqual(1, review_service.get_dashboard()["today_new_count"])
+
+        review_id = review_service.list_records()[0]["review_id"]
+        context = {"kind": "review_practice", "review_ids": [review_id]}
+        correct = dict(question)
+        correct.update({"is_correct": True, "user_answer": ["B"], "user_answer_text": "B"})
+        review_service.sync_grade([correct], self._paper([correct], context))
+        self.assertEqual(0, review_service.get_dashboard()["today_new_count"])
+
+        wrong = self._question(stem="另一道今日错题")
+        review_service.sync_wrong_answers([wrong], self._paper([wrong]))
+        self.assertEqual(1, review_service.get_dashboard()["today_new_count"])
+        failed_id = [
+            item["review_id"]
+            for item in review_service.list_records()
+            if item["stem"] == "另一道今日错题"
+        ][0]
+        failed_context = {"kind": "review_practice", "review_ids": [failed_id]}
+        failed = dict(wrong)
+        failed.update({"user_answer": ["A"], "user_answer_text": "A"})
+        review_service.sync_grade([failed], self._paper([failed], failed_context))
+        self.assertEqual(1, review_service.get_dashboard()["today_new_count"])
+
+    def test_dashboard_tasks_keep_their_own_topic_titles(self):
+        first = self._question(topic="RAG 分块", stem="第一道错题")
+        second = self._question(topic="Transformer 架构", stem="第二道错题")
+        review_service.sync_wrong_answers([first, second], self._paper([first, second]))
+
+        dashboard = review_service.get_dashboard()
+        today_by_id = {
+            task["topic_id"]: task["topic"]
+            for task in dashboard["today_tasks"]
+        }
+        self.assertEqual("RAG 分块", today_by_id["rag分块"])
+        self.assertEqual("Transformer 架构", today_by_id["transformer架构"])
+        self.assertEqual(2, dashboard["today_new_count"])
+
 if __name__ == "__main__":
     unittest.main()

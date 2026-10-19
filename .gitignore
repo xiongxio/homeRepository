@@ -12,3 +12,13 @@ __pycache__/
 .vscode/
 *.local
 *.log
+
+# 本地个人 / 实验性目录，避免误推
+/.codex/
+/.agents/
+/.whisper-restore/
+/jev-arena/
+/mermaid-tool/
+/ticket_router/
+/workspace_*/
+/data/

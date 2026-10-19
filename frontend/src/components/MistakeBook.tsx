@@ -17,7 +17,12 @@ const TYPE_LABEL: Record<string, string> = {
 }
 
 const moduleLabel = (module: string) =>
-  module === '综合测试能力' || !module ? '传统软件测试' : module
+  module === '综合测试能力' ? '传统软件测试' : module || '待分类'
+
+const weaknessScore = (topic: TopicProgress) => {
+  const lastAnswerCorrect = topic.streak === 0 ? 0 : 1
+  return topic.accuracy * 0.65 + lastAnswerCorrect * 0.35
+}
 
 function getTopicHint(topic: TopicProgress): string {
   if (topic.total < 4) {
@@ -49,13 +54,18 @@ export function MistakeBook({
   const [practiceError, setPracticeError] = useState('')
   const topics = (progress?.topics ?? [])
     .slice()
-    .sort((left, right) => left.accuracy - right.accuracy)
+    .sort(
+      (left, right) =>
+        weaknessScore(left) - weaknessScore(right) ||
+        (right.updated_at ?? 0) - (left.updated_at ?? 0) ||
+        right.total - left.total,
+    )
     .slice(0, 5)
   const hasData = Boolean(progress && progress.answered_total > 0)
 
   const moduleTopics = (module: string): TopicProgress[] =>
     (progress?.topics ?? []).filter(
-      (item) => moduleLabel(item.module || '综合测试能力') === module,
+      (item) => moduleLabel(item.module || '') === module,
     )
 
   const handlePracticeTopics = async (label: string, keywords: string[]) => {

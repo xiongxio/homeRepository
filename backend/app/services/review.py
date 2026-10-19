@@ -75,6 +75,35 @@ def _start_of_next_day(now: int | None = None) -> int:
     return int(next_day.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 
+def _start_of_today(now: int | None = None) -> int:
+    now = int(now if now is not None else time.time())
+    today = datetime.fromtimestamp(now)
+    return int(today.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def _dashboard_task(topic_id: str, topic: str, records: list[dict]) -> dict:
+    source_docs: list[str] = []
+    public_records: list[dict] = []
+    review_ids: list[str] = []
+    for record in records:
+        review_id = record.get("review_id")
+        if review_id:
+            review_ids.append(review_id)
+        public_records.append(_public_record(record))
+        lineage = record.get("source_lineage") if isinstance(record.get("source_lineage"), dict) else {}
+        for title in lineage.get("paper_doc_titles") or []:
+            if title and title not in source_docs:
+                source_docs.append(title)
+    return {
+        "topic_id": topic_id,
+        "topic": topic,
+        "due_count": len(records),
+        "review_ids": review_ids,
+        "source_docs": source_docs,
+        "records": public_records,
+    }
+
+
 def _load_state() -> dict:
     if not REVIEW_FILE.exists():
         return {"schema_version": 1, "records": []}
@@ -542,40 +571,47 @@ def get_dashboard() -> dict:
     meta = _load_review_meta()
     pending_count = len(_load_sync_queue()["pending"])
     now = int(time.time())
+    today_start = _start_of_today(now)
     due = [
         item
         for item in records
         if item.get("status") == "active" and int(item.get("next_review_at") or 0) <= now
     ]
-    tasks: dict[str, dict] = {}
+    due_ids = {item.get("review_id") for item in due}
+    today_new = [
+        item
+        for item in records
+        if item.get("status") == "active"
+        and int(item.get("created_at") or 0) >= today_start
+        and int(item.get("review_stage") or 0) == 0
+        and item.get("review_id") not in due_ids
+    ]
+    due_groups: dict[str, list[dict]] = {}
     for record in due:
         topic_id = str(record.get("topic_id") or _normalise_topic_id(record.get("topic") or ""))
-        task = tasks.setdefault(
-            topic_id,
-            {
-                "topic_id": topic_id,
-                "topic": record.get("topic") or "未分类",
-                "due_count": 0,
-                "review_ids": [],
-                "next_review_at": 0,
-                "source_docs": [],
-                "records": [],
-            },
-        )
-        task["due_count"] += 1
-        task["review_ids"].append(record.get("review_id"))
-        task["records"].append(_public_record(record))
-        lineage = record.get("source_lineage") if isinstance(record.get("source_lineage"), dict) else {}
-        for title in lineage.get("paper_doc_titles") or []:
-            if title and title not in task["source_docs"]:
-                task["source_docs"].append(title)
+        due_groups.setdefault(topic_id, []).append(record)
 
-    sorted_tasks = sorted(
-        tasks.values(),
-        key=lambda item: (-item["due_count"], item["topic"]),
-    )
+    today_groups: dict[str, list[dict]] = {}
+    for record in today_new:
+        topic_id = str(record.get("topic_id") or _normalise_topic_id(record.get("topic") or ""))
+        today_groups.setdefault(topic_id, []).append(record)
+
+    def sorted_tasks(groups: dict[str, list[dict]]) -> list[dict]:
+        tasks = [
+            _dashboard_task(
+                topic_id,
+                grouped_records[0].get("topic") or "未分类",
+                grouped_records,
+            )
+            for topic_id, grouped_records in groups.items()
+        ]
+        return sorted(tasks, key=lambda item: (-item["due_count"], item["topic"]))
+
+    due_tasks = sorted_tasks(due_groups)
+    today_tasks = sorted_tasks(today_groups)
     return {
         "due_count": len(due),
+        "today_new_count": len(today_new),
         "active_count": sum(item.get("status") == "active" for item in records),
         "graduated_count": sum(item.get("status") == "graduated" for item in records),
         "archived_count": sum(item.get("status") == "archived" for item in records),
@@ -583,7 +619,8 @@ def get_dashboard() -> dict:
         "current_streak": meta["current_streak"],
         "longest_streak": meta["longest_streak"],
         "total_completed_days": meta["total_completed_days"],
-        "tasks": sorted_tasks,
+        "tasks": due_tasks,
+        "today_tasks": today_tasks,
         "updated_at": now,
     }
 
@@ -594,22 +631,33 @@ def get_knowledge_map() -> dict:
     return quiz_service.get_progress()
 
 
-def generate_practice_paper(topic_id: str, total: int = 5) -> dict:
+def generate_practice_paper(
+    topic_id: str,
+    total: int = 5,
+    include_today: bool = False,
+) -> dict:
     """为一个知识点生成 5 道复盘变形题，并绑定本次要推进的复盘记录。"""
     from . import knowledge as knowledge_service
     from . import quiz as quiz_service
 
     migrate_legacy_mistakes()
     now = int(time.time())
+    today_start = _start_of_today(now)
     records = [
         item
         for item in _load_state()["records"]
         if item.get("topic_id") == topic_id
         and item.get("status") == "active"
-        and int(item.get("next_review_at") or 0) <= now
+        and (
+            int(item.get("next_review_at") or 0) <= now
+            or (
+                include_today
+                and int(item.get("created_at") or 0) >= today_start
+            )
+        )
     ]
     if not records:
-        raise ReviewError("这个知识点当前没有到期待复盘的错题。")
+        raise ReviewError("这个知识点当前没有可复盘的错题。")
     if total != 5:
         raise ReviewError("复盘练习固定一次 5 题。")
 
@@ -656,6 +704,7 @@ def generate_practice_paper(topic_id: str, total: int = 5) -> dict:
         "kind": "review_practice",
         "topic_id": topic_id,
         "topic": topic,
+        "include_today": include_today,
         "review_ids": [item.get("review_id") for item in records],
         "requested_total": total,
     }

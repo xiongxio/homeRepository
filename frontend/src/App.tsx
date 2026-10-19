@@ -13,8 +13,9 @@ import {
   RotateCcw,
   Settings,
   BookOpenCheck,
+  X,
 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   analyze,
   createTranscriptionJob,
@@ -25,6 +26,7 @@ import {
   listMistakes,
   pollJob,
   getReviewDashboard,
+  isAbortError,
   searchKnowledge,
 } from './api'
 import { ChunkedUploader } from './components/ChunkedUploader'
@@ -141,6 +143,12 @@ export default function App() {
     sourceDocIds?: string[]
     sourceTag?: string
   } | null>(null)
+  const requestIdRef = useRef(0)
+  const analysisRequestRef = useRef<{ id: number; controller: AbortController } | null>(null)
+  const transcriptionRequestRef = useRef<{
+    id: number
+    controller: AbortController
+  } | null>(null)
 
   useEffect(() => {
     window.localStorage.setItem('opc-jd', jd)
@@ -191,6 +199,37 @@ export default function App() {
     return () => window.clearTimeout(timer)
   }, [toast])
 
+  useEffect(() => {
+    return () => {
+      analysisRequestRef.current?.controller.abort()
+      transcriptionRequestRef.current?.controller.abort()
+    }
+  }, [])
+
+  const cancelTranscription = useCallback(() => {
+    transcriptionRequestRef.current?.controller.abort()
+    transcriptionRequestRef.current = null
+    setJob(null)
+    setTranscript('')
+    setError('')
+    setToast({
+      id: Date.now(),
+      message: '已停止等待本次转写，可重新上传或改用粘贴转写。',
+    })
+  }, [])
+
+  const cancelAnalysis = useCallback(() => {
+    analysisRequestRef.current?.controller.abort()
+    analysisRequestRef.current = null
+    setPhase('input')
+    setError('')
+    setKnowledgeChunkCount(0)
+    setToast({
+      id: Date.now(),
+      message: '已停止等待本次 AI 分析，可修改内容后重新开始。',
+    })
+  }, [])
+
   const handlePaperReady = useCallback((next: QuizPaper) => {
     setPaper(next)
     setAttempt(null)
@@ -235,12 +274,19 @@ export default function App() {
   )
 
   const handleUploaded = useCallback(async (fileId: string, file: File) => {
+    const requestId = ++requestIdRef.current
+    transcriptionRequestRef.current?.controller.abort()
+    const controller = new AbortController()
+    transcriptionRequestRef.current = { id: requestId, controller }
+    const isCurrent = () => transcriptionRequestRef.current?.id === requestId
+
     setUploadedFile({ id: fileId, name: file.name, size: file.size })
     setJob(null)
     setTranscript('')
     setError('')
     try {
-      const created = await createTranscriptionJob(fileId)
+      const created = await createTranscriptionJob(fileId, controller.signal)
+      if (!isCurrent()) return
       setJob({
         job_id: created.job_id,
         file_id: fileId,
@@ -248,12 +294,23 @@ export default function App() {
         stage: '排队中',
         progress: 0,
       })
-      const finished = await pollJob(created.job_id, setJob)
+      const finished = await pollJob(
+        created.job_id,
+        (nextJob) => {
+          if (isCurrent()) setJob(nextJob)
+        },
+        1500,
+        controller.signal,
+      )
+      if (!isCurrent()) return
       setTranscript(finished.result?.text ?? '')
     } catch (transcribeError) {
+      if (isAbortError(transcribeError) || !isCurrent()) return
       setError(
         transcribeError instanceof Error ? transcribeError.message : '转写失败，请重试。',
       )
+    } finally {
+      if (isCurrent()) transcriptionRequestRef.current = null
     }
   }, [])
 
@@ -263,6 +320,12 @@ export default function App() {
   const startAnalysis = async (overrideTranscript?: string) => {
     const source = (overrideTranscript ?? transcript).trim()
     if (!source) return
+    const requestId = ++requestIdRef.current
+    analysisRequestRef.current?.controller.abort()
+    const controller = new AbortController()
+    analysisRequestRef.current = { id: requestId, controller }
+    const isCurrent = () => analysisRequestRef.current?.id === requestId
+
     setPhase('analyzing')
     setError('')
     setKnowledgeChunkCount(0)
@@ -271,7 +334,12 @@ export default function App() {
       if (documents.length > 0) {
         try {
           const query = `${jd}\n${resume}\n${source.slice(0, 1800)}`.trim()
-          const chunks = await searchKnowledge(query || source.slice(0, 1800), 6)
+          const chunks = await searchKnowledge(
+            query || source.slice(0, 1800),
+            6,
+            controller.signal,
+          )
+          if (!isCurrent()) return
           setKnowledgeChunkCount(chunks.length)
           knowledge = chunks
             .map(
@@ -279,22 +347,30 @@ export default function App() {
                 `[资料 ${index + 1}] ${chunk.title}\n${chunk.text}`,
             )
             .join('\n\n')
-        } catch {
+        } catch (knowledgeError) {
+          if (isAbortError(knowledgeError) || !isCurrent()) throw knowledgeError
           knowledge = ''
         }
       }
-      const result = await analyze({
-        transcript: source,
-        jd,
-        resume,
-        knowledge,
-        resume_id: activeResume?.resume_id,
-      })
+      const result = await analyze(
+        {
+          transcript: source,
+          jd,
+          resume,
+          knowledge,
+          resume_id: activeResume?.resume_id,
+        },
+        controller.signal,
+      )
+      if (!isCurrent()) return
       setReport(result)
       setPhase('report')
     } catch (analysisError) {
+      if (isAbortError(analysisError) || !isCurrent()) return
       setError(analysisError instanceof Error ? analysisError.message : 'AI 分析失败，请重试。')
       setPhase('input')
+    } finally {
+      if (isCurrent()) analysisRequestRef.current = null
     }
   }
 
@@ -313,6 +389,10 @@ export default function App() {
   )
 
   const restart = () => {
+    analysisRequestRef.current?.controller.abort()
+    analysisRequestRef.current = null
+    transcriptionRequestRef.current?.controller.abort()
+    transcriptionRequestRef.current = null
     setPhase('input')
     setInputMode('upload')
     setUploadedFile(null)
@@ -334,6 +414,8 @@ export default function App() {
     phase === 'input' &&
     !isTranscribing &&
     Boolean(uploadedFile || job || transcript.trim() || error)
+  const canCancelPractice =
+    view === 'practice' && (isTranscribing || phase === 'analyzing')
 
   return (
     <div className="min-h-screen bg-zinc-100">
@@ -410,6 +492,16 @@ export default function App() {
               <button type="button" className="secondary-btn h-10 px-3 text-sm font-medium" onClick={restart}>
                 <RotateCcw className="size-4" aria-hidden="true" />
                 重置
+              </button>
+            )}
+            {canCancelPractice && (
+              <button
+                type="button"
+                className="secondary-btn h-10 px-3 text-sm font-medium"
+                onClick={phase === 'analyzing' ? cancelAnalysis : cancelTranscription}
+              >
+                <X className="size-4" aria-hidden="true" />
+                {phase === 'analyzing' ? '取消分析' : '取消转写'}
               </button>
             )}
             <button

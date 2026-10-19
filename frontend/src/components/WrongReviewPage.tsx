@@ -71,7 +71,7 @@ const REVIEW_TABS: { value: ReviewTab; label: string; icon: typeof CalendarClock
 ]
 
 const moduleLabel = (module: string) =>
-  module === '综合测试能力' || !module ? '传统软件测试' : module
+  module === '综合测试能力' ? '传统软件测试' : module || '待分类'
 
 function formatDate(timestamp: number): string {
   if (!timestamp) return '—'
@@ -297,7 +297,7 @@ export function WrongReviewPage({
   const moduleStats = progress?.module_stats ?? []
   const activeModule = selectedModule || moduleStats[0]?.module || ''
   const moduleTopics = (progress?.topics ?? []).filter(
-    (item) => moduleLabel(item.module || '综合测试能力') === activeModule,
+    (item) => moduleLabel(item.module || '') === activeModule,
   )
   const priorityTopics = activeModule
     ? moduleTopics

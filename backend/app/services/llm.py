@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import logging
@@ -10,6 +11,7 @@ from openai import (
     APIStatusError,
     APITimeoutError,
     InternalServerError,
+    AsyncOpenAI,
     OpenAI,
 )
 
@@ -148,6 +150,61 @@ def _completion(client: OpenAI, *, model: str, messages: list[dict], temperature
     raise last_exc
 
 
+async def _acompletion(
+    client: AsyncOpenAI,
+    *,
+    model: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool,
+):
+    """异步补全入口，错误分类、JSON 回退和重试策略与同步版本保持一致。"""
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    use_json_mode = json_mode
+    if use_json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    last_exc: Exception | None = None
+    for attempt in range(_COMPLETION_MAX_ATTEMPTS):
+        is_last = attempt + 1 >= _COMPLETION_MAX_ATTEMPTS
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            text = str(exc).lower()
+            if use_json_mode and any(
+                keyword in text
+                for keyword in ("response_format", "json_object", "json mode", "unsupported parameter")
+            ):
+                if is_last:
+                    raise
+                use_json_mode = False
+                kwargs.pop("response_format", None)
+                continue
+            if _is_transient_upstream_error(exc):
+                if is_last:
+                    raise
+                backoff = _COMPLETION_RETRY_BACKOFF * (attempt + 1)
+                llm_logger.warning(
+                    "transient LLM error attempt=%d/%d type=%s backoff=%.1fs err=%s",
+                    attempt + 1,
+                    _COMPLETION_MAX_ATTEMPTS,
+                    type(exc).__name__,
+                    backoff,
+                    str(exc)[:200],
+                )
+                await asyncio.sleep(backoff)
+                continue
+            raise
+    assert last_exc is not None  # pragma: no cover - 不可达
+    raise last_exc
+
+
 def chat_json(
     system: str,
     user: str,
@@ -235,6 +292,100 @@ def chat_json(
             ]
     llm_logger.warning(
         "call failed provider=%s model=%s last_error=%s",
+        provider_name,
+        model or resolved_model,
+        str(last_error)[:200] if last_error else "",
+    )
+    raise LlmError(str(last_error) if last_error else "LLM 返回内容无法解析为 JSON。")
+
+
+async def chat_json_async(
+    system: str,
+    user: str,
+    max_tokens: int = 8000,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """异步版 JSON 调用，支持随请求取消并立即中断上游 HTTP 请求。"""
+    api_key, base_url, resolved_model = _provider_config(provider)
+    provider_name = provider or settings.llm_provider
+    if timeout is None:
+        if provider_name == "minimax":
+            try:
+                timeout = float(getattr(settings, "minimax_timeout_seconds", 180))
+            except (TypeError, ValueError):
+                timeout = 180.0
+        else:
+            timeout = CHAT_TIMEOUT_SECONDS
+    llm_logger.info(
+        "async call start provider=%s model=%s max_tokens=%d timeout=%.1f",
+        provider_name,
+        model or resolved_model,
+        max_tokens,
+        timeout,
+    )
+    start_ts = time.perf_counter()
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    last_error: Exception | None = None
+    async with AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+        max_retries=0,
+    ) as client:
+        for attempt in range(2):
+            try:
+                resp_iter = await _acompletion(
+                    client,
+                    model=model or resolved_model,
+                    messages=messages,
+                    temperature=0.3 if attempt == 0 else 0.2,
+                    max_tokens=max_tokens,
+                    json_mode=True,
+                )
+            except Exception as exc:
+                raise LlmError(_classify_upstream_error(exc) or f"调用 LLM 失败: {exc}") from exc
+            choice_iter = resp_iter.choices[0]
+            content_iter = choice_iter.message.content or ""
+            elapsed = time.perf_counter() - start_ts
+            llm_logger.info(
+                "async call attempt=%d provider=%s model=%s elapsed=%.2f finish=%s content_len=%d",
+                attempt,
+                provider_name,
+                model or resolved_model,
+                elapsed,
+                choice_iter.finish_reason,
+                len(content_iter),
+            )
+            if choice_iter.finish_reason == "length":
+                if not content_iter.strip():
+                    raise LlmEmptyResponseError(
+                        "模型返回了空内容且 finish_reason=length，上游可能出现异常（限流、账号异常等）。请稍后重试或切换其它模型。"
+                    )
+                raise LlmLengthError(
+                    "模型输出达到长度上限被截断，返回的 JSON 不完整。系统将自动减少单批题量重试，不需手动缩少输入。"
+                )
+            try:
+                return _parse_json(content_iter)
+            except LlmError as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": content_iter},
+                    {
+                        "role": "user",
+                        "content": (
+                            "上面输出无法解析为 JSON，请只输出严格合法的 JSON，"
+                            "不要包含<think>、解释、注释或前后缀文字。"
+                        ),
+                    },
+                ]
+    llm_logger.warning(
+        "async call failed provider=%s model=%s last_error=%s",
         provider_name,
         model or resolved_model,
         str(last_error)[:200] if last_error else "",

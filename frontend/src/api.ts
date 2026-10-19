@@ -56,6 +56,15 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (text ? JSON.parse(text) : undefined) as T
 }
 
+export function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'name' in error &&
+    (error as { name?: unknown }).name === 'AbortError'
+  )
+}
+
 export async function initUpload(file: File): Promise<UploadInitResponse> {
   return apiFetch<UploadInitResponse>('/uploads/init', {
     method: 'POST',
@@ -146,11 +155,15 @@ export async function uploadFile(
   return completeUpload(init.upload_id)
 }
 
-export async function createTranscriptionJob(fileId: string): Promise<JobCreateResponse> {
+export async function createTranscriptionJob(
+  fileId: string,
+  signal?: AbortSignal,
+): Promise<JobCreateResponse> {
   return apiFetch<JobCreateResponse>('/jobs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ file_id: fileId }),
+    signal,
   })
 }
 
@@ -158,34 +171,73 @@ export function pollJob(
   jobId: string,
   onUpdate: (job: JobState) => void,
   intervalMs = 1500,
+  signal?: AbortSignal,
 ): Promise<JobState> {
   return new Promise((resolve, reject) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+      signal?.removeEventListener('abort', handleAbort)
+    }
+
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      callback()
+    }
+
+    const handleAbort = () => {
+      const error = new Error('请求已取消')
+      error.name = 'AbortError'
+      finish(() => reject(error))
+    }
+
+    if (signal?.aborted) {
+      handleAbort()
+      return
+    }
+    signal?.addEventListener('abort', handleAbort, { once: true })
+
     const poll = async () => {
       try {
-        const job = await apiFetch<JobState>(`/jobs/${jobId}`)
+        const job = await apiFetch<JobState>(`/jobs/${jobId}`, { signal })
+        if (settled) return
         onUpdate(job)
         if (job.status === 'done') {
-          resolve(job)
+          finish(() => resolve(job))
           return
         }
         if (job.status === 'error') {
-          reject(new Error(job.error || '转写任务失败'))
+          finish(() => reject(new Error(job.error || '转写任务失败')))
           return
         }
-        setTimeout(poll, intervalMs)
+        timer = setTimeout(() => {
+          void poll()
+        }, intervalMs)
       } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)))
+        if (settled) return
+        finish(() => reject(error instanceof Error ? error : new Error(String(error))))
       }
     }
     void poll()
   })
 }
 
-export async function analyze(request: AnalyzeRequest): Promise<AnalysisReport> {
+export async function analyze(
+  request: AnalyzeRequest,
+  signal?: AbortSignal,
+): Promise<AnalysisReport> {
   return apiFetch<AnalysisReport>('/analyze', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
+    signal,
   })
 }
 
@@ -342,9 +394,10 @@ export async function streamSpeech(request: {
 export async function searchKnowledge(
   query: string,
   limit = 6,
+  signal?: AbortSignal,
 ): Promise<KnowledgeChunk[]> {
   const params = new URLSearchParams({ q: query, limit: String(limit) })
-  return apiFetch<KnowledgeChunk[]>(`/knowledge/search?${params.toString()}`)
+  return apiFetch<KnowledgeChunk[]>(`/knowledge/search?${params.toString()}`, { signal })
 }
 
 export async function requestInterviewTurn(
@@ -527,10 +580,13 @@ export async function saveReviewErrorCause(
 
 export async function generateReviewPractice(
   topicId: string,
+  includeToday = false,
 ): Promise<QuizPaper> {
-  return apiFetch<QuizPaper>(`/quiz/review/tasks/${encodeURIComponent(topicId)}/practice`, {
-    method: 'POST',
-  })
+  const query = includeToday ? '?include_today=true' : ''
+  return apiFetch<QuizPaper>(
+    `/quiz/review/tasks/${encodeURIComponent(topicId)}/practice${query}`,
+    { method: 'POST' },
+  )
 }
 
 export async function getExpressionQuestion(

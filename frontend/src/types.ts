@@ -629,6 +629,7 @@ export interface ReviewTask {
 
 export interface ReviewDashboard {
   due_count: number
+  today_new_count?: number
   active_count: number
   graduated_count: number
   archived_count: number
@@ -637,6 +638,7 @@ export interface ReviewDashboard {
   longest_streak?: number
   total_completed_days?: number
   tasks: ReviewTask[]
+  today_tasks?: ReviewTask[]
   updated_at: number
 }
 
@@ -651,6 +653,7 @@ export interface TopicProgress {
   verified_types?: QuestionType[]
   cross_type_verified?: boolean
   module?: string
+  updated_at?: number
 }
 
 export interface QuizProgress {

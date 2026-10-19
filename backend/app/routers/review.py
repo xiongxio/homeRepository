@@ -1,6 +1,6 @@
 import asyncio
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from ..schemas import ReviewErrorCauseRequest
 from ..services import review as review_service
@@ -30,9 +30,17 @@ async def sync_retry():
 
 
 @router.post("/tasks/{topic_id}/practice")
-async def practice(topic_id: str):
+async def practice(
+    topic_id: str,
+    include_today: bool = Query(default=False),
+):
     try:
-        paper = await asyncio.to_thread(review_service.generate_practice_paper, topic_id)
+        paper = await asyncio.to_thread(
+            review_service.generate_practice_paper,
+            topic_id,
+            5,
+            include_today,
+        )
     except review_service.ReviewError as exc:
         raise HTTPException(422, str(exc))
     from ..services import quiz as quiz_service

@@ -149,5 +149,85 @@ class ReviewApiSmokeTests(unittest.TestCase):
         self.assertEqual(0, retry.json()["pending_count"])
 
 
+    def test_today_new_dashboard_and_include_today_practice_api(self):
+        question = {
+            "topic": "接口自动化",
+            "type": "single",
+            "stem": "API 自动化断言应该校验什么？",
+            "options": [
+                {"key": "A", "text": "只校验 HTTP 200"},
+                {"key": "B", "text": "状态码、关键业务字段和契约"},
+            ],
+            "correct_answer": ["B"],
+            "correct_answer_text": "B",
+            "user_answer": ["A"],
+            "user_answer_text": "A",
+            "is_correct": False,
+            "explanation": "接口断言要覆盖业务结果。",
+            "source_title": "接口测试讲义",
+            "source_doc_id": "doc_api",
+            "source_docs": [{"doc_id": "doc_api", "title": "接口测试讲义"}],
+        }
+        paper = {
+            "paper_id": "paper_today",
+            "title": "今日错题卷",
+            "doc_ids": ["doc_api"],
+            "doc_titles": ["接口测试讲义"],
+            "source_docs": [{"doc_id": "doc_api", "title": "接口测试讲义"}],
+            "questions": [question],
+            "generation_context": {"kind": "normal_quiz"},
+        }
+        review_service.sync_wrong_answers([question], paper)
+
+        dashboard = self.client.get("/api/quiz/review/dashboard")
+        self.assertEqual(200, dashboard.status_code)
+        body = dashboard.json()
+        self.assertEqual(1, body["today_new_count"])
+        self.assertEqual(0, body["due_count"])
+        self.assertEqual(1, len(body["today_tasks"]))
+        self.assertEqual("接口自动化", body["today_tasks"][0]["topic"])
+        self.assertEqual(0, len(body["tasks"]))
+
+        review_id = body["today_tasks"][0]["review_ids"][0]
+        fake_paper = {
+            "paper_id": "paper_api_today_review",
+            "title": "今日新错即时复盘",
+            "questions": [],
+            "generation_context": {
+                "kind": "review_practice",
+                "topic_id": "接口自动化",
+                "include_today": True,
+                "review_ids": [review_id],
+            },
+        }
+        with (
+            patch(
+                "backend.app.services.knowledge.list_documents",
+                return_value=[{"doc_id": "doc_api", "title": "接口测试讲义"}],
+            ),
+            patch.object(
+                review_service,
+                "generate_practice_paper",
+                return_value=fake_paper,
+            ) as fake_generate,
+            patch.object(
+                quiz_service,
+                "get_paper",
+                return_value=fake_paper,
+            ),
+        ):
+            practice = self.client.post(
+                "/api/quiz/review/tasks/%E6%8E%A5%E5%8F%A3%E8%87%AA%E5%8A%A8%E5%8C%96/practice?include_today=true"
+            )
+
+        self.assertEqual(200, practice.status_code)
+        self.assertTrue(practice.json()["generation_context"]["include_today"])
+        self.assertEqual(
+            True,
+            fake_generate.call_args.kwargs.get("include_today")
+            if fake_generate.call_args.kwargs
+            else fake_generate.call_args.args[2],
+        )
+
 if __name__ == "__main__":
     unittest.main()
