@@ -127,6 +127,45 @@ function formatReviewAge(timestamp: number): string {
   return `${date.getMonth() + 1}/${date.getDate()}`
 }
 
+interface ReviewGroup {
+  key: string
+  topic: string
+  records: ReviewRecord[]
+  representative: ReviewRecord
+  latestAt: number
+}
+
+function reviewGroupKey(record: ReviewRecord): string {
+  return (record.topic_id || record.topic || record.review_id).trim()
+}
+
+function buildReviewGroups(records: ReviewRecord[]): ReviewGroup[] {
+  const buckets = new Map<string, ReviewRecord[]>()
+  for (const record of records) {
+    const key = reviewGroupKey(record)
+    const bucket = buckets.get(key)
+    if (bucket) {
+      bucket.push(record)
+    } else {
+      buckets.set(key, [record])
+    }
+  }
+  return Array.from(buckets.entries())
+    .map(([key, groupRecords]) => {
+      const sorted = [...groupRecords].sort(
+        (left, right) => reviewActivityAt(right) - reviewActivityAt(left),
+      )
+      return {
+        key,
+        topic: sorted[0]?.topic || '未分类',
+        records: sorted,
+        representative: sorted[0],
+        latestAt: reviewActivityAt(sorted[0]),
+      }
+    })
+    .sort((left, right) => right.latestAt - left.latestAt)
+}
+
 function formatClock(seconds: number): string {
   const minutes = Math.floor(seconds / 60)
   const rest = seconds % 60
@@ -330,31 +369,36 @@ export function ExpressionDrill({
   const shouldTranscribeRef = useRef(false)
   const answerRoundRef = useRef(0)
   const isRetrying = previousSessionId !== ''
-  const filteredReviewRecords = useMemo(() => {
+  const reviewGroups = useMemo(() => buildReviewGroups(reviewRecords), [reviewRecords])
+  const filteredReviewGroups = useMemo(() => {
     const tokens = reviewSearch.trim().toLowerCase().split(/\s+/).filter(Boolean)
     const range = REVIEW_RANGES.find((item) => item.key === reviewRange)
     const cutoff =
       range && range.days > 0 ? Date.now() - range.days * 86_400_000 : 0
-    return reviewRecords
-      .filter((record) => {
-        if (cutoff && reviewActivityAt(record) < cutoff) return false
+    return reviewGroups
+      .filter((group) => {
+        if (cutoff && group.latestAt < cutoff) return false
         if (tokens.length === 0) return true
-        const haystack = [
-          record.topic,
-          record.stem,
-          record.source_title ?? '',
-          ...(record.error_causes ?? []),
-          ...(record.options ?? []).map((option) => option.text),
-        ]
+        const haystack = group.records
+          .flatMap((record) => [
+            record.topic,
+            record.stem,
+            record.source_title ?? '',
+            ...(record.error_causes ?? []),
+            ...(record.options ?? []).map((option) => option.text),
+          ])
           .join(' ')
           .toLowerCase()
         return tokens.every((token) => haystack.includes(token))
       })
-      .sort((left, right) => reviewActivityAt(right) - reviewActivityAt(left))
-  }, [reviewRecords, reviewSearch, reviewRange])
-  const selectedReview = useMemo(
-    () => reviewRecords.find((record) => record.review_id === selectedReviewId) ?? null,
-    [reviewRecords, selectedReviewId],
+      .sort((left, right) => right.latestAt - left.latestAt)
+  }, [reviewGroups, reviewSearch, reviewRange])
+  const selectedReviewGroup = useMemo(
+    () =>
+      reviewGroups.find((group) =>
+        group.records.some((record) => record.review_id === selectedReviewId),
+      ) ?? null,
+    [reviewGroups, selectedReviewId],
   )
   const [mediaSupported] = useState(
     () =>
@@ -988,36 +1032,45 @@ export function ExpressionDrill({
           {sourceType === 'mistake' && (
             <div>
               <div className="flex items-center justify-between gap-3">
-                <span className="field-label">选择错题</span>
-                {selectedReview && (
+                <span className="field-label">选择知识点</span>
+                {selectedReviewGroup && (
                   <button
                     type="button"
                     className="text-xs font-semibold text-emerald-700 underline underline-offset-2"
                     onClick={() => setReviewPickerOpen((open) => !open)}
                     disabled={Boolean(busy)}
                   >
-                    {reviewPickerOpen ? '收起列表' : '更换错题'}
+                    {reviewPickerOpen ? '收起列表' : '更换知识点'}
                   </button>
                 )}
               </div>
 
-              {selectedReview ? (
+              {selectedReviewGroup ? (
                 <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50/70 px-3 py-2.5">
                   <p className="truncate text-xs font-semibold text-emerald-800">
-                    {selectedReview.topic}
+                    {selectedReviewGroup.topic}
                   </p>
-                  <p className="mt-1 line-clamp-2 text-sm leading-6 text-zinc-800">
-                    {selectedReview.stem}
-                  </p>
+                  {selectedReviewGroup.records.length > 1 ? (
+                    <p className="mt-1 text-sm leading-6 text-zinc-700">
+                      {selectedReviewGroup.records.length} 道错题已合并，训练时会改写成一道问答题。
+                    </p>
+                  ) : (
+                    <p className="mt-1 line-clamp-2 text-sm leading-6 text-zinc-800">
+                      {selectedReviewGroup.representative.stem}
+                    </p>
+                  )}
                   <p className="mt-1 text-xs text-zinc-500">
-                    错 {selectedReview.wrong_count} 次 ·{' '}
-                    {formatReviewAge(reviewActivityAt(selectedReview))}
+                    {selectedReviewGroup.records.length > 1
+                      ? `该知识点共 ${selectedReviewGroup.records.length} 道错题，合并成 1 道问答题`
+                      : `错 ${selectedReviewGroup.representative.wrong_count} 次`}
+                    {' · '}
+                    {formatReviewAge(selectedReviewGroup.latestAt)}
                   </p>
                 </div>
               ) : (
                 <p className="mt-1.5 text-xs leading-5 text-zinc-500">
                   {reviewRecords.length > 0
-                    ? '在下面的列表里搜索并选择一道错题，只会围绕这一道题展开。'
+                    ? '在下面的列表里搜索并选择一个知识点，同知识点的多道错题会合并成一道问答题。'
                     : '还没有错题复盘记录，先在「在线刷题」完成答卷并同步错题。'}
                 </p>
               )}
@@ -1061,44 +1114,49 @@ export function ExpressionDrill({
                     })}
                   </div>
                   <p className="mt-2 text-xs text-zinc-500">
-                    共 {reviewRecords.length} 道，当前匹配 {filteredReviewRecords.length} 道
+                    共 {reviewGroups.length} 个知识点（{reviewRecords.length} 道错题），当前匹配{' '}
+                    {filteredReviewGroups.length} 个知识点
                   </p>
                   <div className="mt-1.5 max-h-64 space-y-1 overflow-y-auto">
-                    {filteredReviewRecords.length === 0 ? (
+                    {filteredReviewGroups.length === 0 ? (
                       <p className="rounded-md bg-zinc-50 px-3 py-4 text-center text-xs leading-5 text-zinc-500">
                         没有匹配的错题，试试放宽时间范围或换个关键词。
                       </p>
                     ) : (
-                      filteredReviewRecords.map((record) => {
-                        const active = record.review_id === selectedReviewId
+                      filteredReviewGroups.map((group) => {
+                        const active = group.records.some(
+                          (record) => record.review_id === selectedReviewId,
+                        )
                         return (
                           <button
-                            key={record.review_id}
+                            key={group.key}
                             type="button"
                             className={`flex w-full items-start gap-2 rounded-md border px-2.5 py-2 text-left transition ${
                               active
                                 ? 'border-emerald-400 bg-emerald-50'
                                 : 'border-transparent hover:border-zinc-200 hover:bg-zinc-50'
                             }`}
-                            onClick={() => changeReviewRecord(record.review_id)}
+                            onClick={() => changeReviewRecord(group.representative.review_id)}
                             aria-pressed={active}
                             disabled={Boolean(busy)}
                           >
                             <span className="min-w-0 flex-1">
                               <span className="flex items-center gap-2">
                                 <span className="truncate text-xs font-medium text-zinc-500">
-                                  {record.topic}
+                                  {group.topic}
                                 </span>
                                 <span className="shrink-0 text-[11px] text-zinc-400">
-                                  错 {record.wrong_count} 次
+                                  {group.records.length > 1
+                                    ? `${group.records.length} 道错题`
+                                    : `错 ${group.representative.wrong_count} 次`}
                                 </span>
                               </span>
                               <span className="mt-0.5 line-clamp-2 block text-sm leading-5 text-zinc-800">
-                                {record.stem}
+                                {group.representative.stem}
                               </span>
                             </span>
                             <span className="mt-0.5 shrink-0 text-[11px] text-zinc-400">
-                              {formatReviewAge(reviewActivityAt(record))}
+                              {formatReviewAge(group.latestAt)}
                             </span>
                           </button>
                         )
@@ -1152,7 +1210,7 @@ export function ExpressionDrill({
             <p className="text-xs font-medium text-zinc-500">
               {question
                 ? question.source_type === 'mistake'
-                  ? `错题表达训练 ${question.label || ''}`
+                  ? `知识点表达训练 ${question.label || ''}`
                   : `真题编号 ${question.label || '未编号'}`
                 : '选好岗位后取一道真题开始'}
             </p>
@@ -1167,7 +1225,11 @@ export function ExpressionDrill({
             )}
             {(question?.source_type === 'mistake' ||
               question?.source_tag === 'wrong_review') && (
-              <p className="mt-1 text-xs font-medium text-emerald-700">来自错题复盘</p>
+              <p className="mt-1 text-xs font-medium text-emerald-700">
+                {question.group_size && question.group_size > 1
+                  ? `已合并「${question.group_topic || topicHint}」下 ${question.group_size} 道错题`
+                  : '来自错题复盘，已改写为问答题'}
+              </p>
             )}
             {question?.source_tag === 'result_page' && (
               <p className="mt-1 text-xs font-medium text-sky-700">来自阅卷结果页</p>
@@ -1186,19 +1248,34 @@ export function ExpressionDrill({
               </p>
             )}
           </div>
-          <button
-            type="button"
-            className="secondary-btn shrink-0"
-            onClick={() => void loadQuestion(roleKey, topicHint)}
-            disabled={Boolean(busy)}
-          >
-            {busy === 'question' ? (
-              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-            ) : (
+          {question?.source_type === 'mistake' ? (
+            <button
+              type="button"
+              className="secondary-btn shrink-0"
+              onClick={() => {
+                setReviewPickerOpen(true)
+                window.scrollTo({ top: 0, behavior: 'smooth' })
+              }}
+              disabled={Boolean(busy)}
+            >
               <RefreshCw className="size-4" aria-hidden="true" />
-            )}
-            换一题
-          </button>
+              换知识点
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="secondary-btn shrink-0"
+              onClick={() => void loadQuestion(roleKey, topicHint)}
+              disabled={Boolean(busy)}
+            >
+              {busy === 'question' ? (
+                <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <RefreshCw className="size-4" aria-hidden="true" />
+              )}
+              换一题
+            </button>
+          )}
         </div>
 
         {topicHint && (
@@ -1211,10 +1288,14 @@ export function ExpressionDrill({
           >
             {busy === 'question'
               ? question?.source_type === 'mistake'
-                ? `正在载入错题「${topicHint}」。`
+                ? `正在把「${topicHint}」下的错题改写成问答题。`
                 : `正在根据薄弱知识点「${topicHint}」选题。`
               : question?.source_type === 'mistake'
-                ? `已绑定错题：${topicHint}。换题会继续围绕这组知识点的同一道错题展开。`
+                ? `已绑定知识点：${question.group_topic || topicHint}${
+                    question.group_size && question.group_size > 1
+                      ? `，${question.group_size} 道错题已合并为一道问答题`
+                      : ''
+                  }。`
                 : question?.topic_matched === false
                 ? `真题库里暂时没有匹配「${topicHint}」的题，已选择最接近的一道真题。练习方向仍按薄弱知识点定位；导入相关真题库后会优先命中。`
                 : `已定位薄弱知识点：${topicHint}。本题来自相关真题。`}

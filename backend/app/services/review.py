@@ -583,6 +583,22 @@ def get_record(review_id: str) -> dict:
     return _public_record(record)
 
 
+def list_topic_records(topic_id: str) -> list[dict]:
+    """读取同一知识点下的全部错题，供表达训练合并成一道问答题。"""
+    key = str(topic_id or "").strip()
+    if not key:
+        return []
+    return [
+        _public_record(item)
+        for item in _load_state()["records"]
+        if str(
+            item.get("topic_id")
+            or _normalise_topic_id(item.get("topic") or "")
+        )
+        == key
+    ]
+
+
 def get_dashboard() -> dict:
     migrate_legacy_mistakes()
     records = _load_state()["records"]

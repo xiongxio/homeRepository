@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from backend.app.main import app
 from backend.app.services import quiz as quiz_service
 from backend.app.services import review as review_service
+from backend.app.services import expression as expression_service
 
 
 class ReviewApiSmokeTests(unittest.TestCase):
@@ -148,7 +149,7 @@ class ReviewApiSmokeTests(unittest.TestCase):
         self.assertEqual(0, retry.json()["retried"])
         self.assertEqual(0, retry.json()["pending_count"])
 
-    def test_expression_question_api_accepts_wrong_review_source(self):
+    def test_expression_question_api_merges_wrong_review_group(self):
         question = {
             "topic": "接口自动化",
             "type": "single",
@@ -167,17 +168,56 @@ class ReviewApiSmokeTests(unittest.TestCase):
             "source_doc_id": "doc_api",
             "source_docs": [{"doc_id": "doc_api", "title": "接口测试讲义"}],
         }
+        judge = {
+            "topic": "接口自动化",
+            "type": "judge",
+            "stem": "接口测试只需要校验 HTTP 状态码。",
+            "options": [
+                {"key": "A", "text": "正确"},
+                {"key": "B", "text": "错误"},
+            ],
+            "correct_answer": ["B"],
+            "correct_answer_text": "B",
+            "user_answer": ["A"],
+            "user_answer_text": "A",
+            "is_correct": False,
+            "explanation": "还要校验业务字段和接口契约。",
+            "source_title": "接口测试讲义",
+            "source_doc_id": "doc_api",
+            "source_docs": [{"doc_id": "doc_api", "title": "接口测试讲义"}],
+        }
         paper = {
             "paper_id": "paper_expression_source",
             "title": "接口测试卷",
-            "questions": [question],
+            "questions": [question, judge],
         }
-        review_service.sync_wrong_answers([question], paper)
+        review_service.sync_wrong_answers([question, judge], paper)
         review_id = review_service.list_records()[0]["review_id"]
+        fake_payload = {
+            "question": "在接口自动化里，你会如何设计断言来保证业务正确性？",
+            "reference_answer": "我会同时校验状态码、关键业务字段和接口契约，避免只看 HTTP 200。",
+            "keywords": ["状态码", "业务字段", "接口契约"],
+            "standard_key_points": ["覆盖业务结果", "不只状态码"],
+            "reference_script": "结论先行：断言要覆盖业务结果，再说明原因。",
+            "source_title": "接口测试讲义",
+        }
 
-        with patch(
-            "backend.app.services.question_bank.load_role_questions",
-            return_value=[],
+        with (
+            patch.object(
+                expression_service,
+                "GENERATED_QUESTION_CACHE_DIR",
+                Path(self._tmp.name) / "expression" / "generated_questions",
+            ),
+            patch.object(expression_service, "_prefetch_speaking_materials"),
+            patch.object(
+                expression_service,
+                "_generate_mistake_question_via_llm",
+                return_value=fake_payload,
+            ),
+            patch(
+                "backend.app.services.question_bank.load_role_questions",
+                return_value=[],
+            ) as load_bank,
         ):
             response = self.client.post(
                 "/api/expression/question",
@@ -190,12 +230,16 @@ class ReviewApiSmokeTests(unittest.TestCase):
                 },
             )
 
+        load_bank.assert_not_called()
         self.assertEqual(200, response.status_code)
         body = response.json()
         self.assertEqual("mistake", body["source_type"])
         self.assertEqual(review_id, body["source_ref"])
-        self.assertIn(question["stem"], body["question"])
-        self.assertIn("接口断言要覆盖业务结果", body["reference_answer"])
+        self.assertEqual(2, body["group_size"])
+        self.assertEqual("接口自动化", body["group_topic"])
+        self.assertEqual(fake_payload["question"], body["question"])
+        self.assertNotRegex(body["question"], r"(下列|哪项|正确的是|判断题)")
+        self.assertNotIn("A.", body["question"])
 
         missing = self.client.post(
             "/api/expression/question",

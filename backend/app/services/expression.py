@@ -16,6 +16,7 @@ import time
 import threading
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 from queue import Queue
@@ -41,6 +42,8 @@ GENERATED_QUESTION_CACHE_DIR = settings.data_dir / "expression" / "generated_que
 GENERATED_QUESTION_CACHE_VERSION = "generated-questions-v1"
 GENERATED_QUESTION_TTL_SECONDS = 7 * 24 * 3600
 EXPRESSION_GENERATE_FAST_WAIT_SECONDS = 6.0
+EXPRESSION_MISTAKE_FAST_WAIT_SECONDS = 8.0
+EXPRESSION_MISTAKE_MAX_RECORDS = 12
 _SPEAKING_JOBS_LOCK = threading.Lock()
 _SPEAKING_JOBS: set[str] = set()
 _SPEAKING_WORK_LIMIT = threading.Semaphore(2)
@@ -543,6 +546,7 @@ def _get_or_start_generation(
     topic_hint: str,
     chunks: list[dict],
     question_type: str = "",
+    generator: Callable[[str, str, list[dict], str], dict | None] | None = None,
 ) -> Queue:
     with _GENERATION_JOBS_LOCK:
         pending = _PENDING_GENERATIONS.get(cache_key)
@@ -552,7 +556,12 @@ def _get_or_start_generation(
         _PENDING_GENERATIONS[cache_key] = queue
 
     def worker() -> None:
-        result = _generate_question_via_llm(role_name, topic_hint, chunks, question_type)
+        result = (generator or _generate_question_via_llm)(
+            role_name,
+            topic_hint,
+            chunks,
+            question_type,
+        )
         if result:
             _save_generated_question(cache_key, result)
         try:
@@ -568,36 +577,6 @@ def _get_or_start_generation(
         daemon=True,
     ).start()
     return queue
-
-
-def _mistake_reference_answer(record: dict) -> str:
-    answer_keys = {
-        str(item).strip().upper()
-        for item in (record.get("correct_answer") or [])
-        if str(item).strip()
-    }
-    option_answers: list[str] = []
-    for option in record.get("options") or []:
-        if not isinstance(option, dict):
-            continue
-        key = str(option.get("key") or "").strip()
-        text = str(option.get("text") or "").strip()
-        if key.upper() in answer_keys and text:
-            option_answers.append(f"{key}. {text}")
-
-    answer_text = "、".join(option_answers)
-    if not answer_text:
-        answer_text = str(record.get("correct_answer_text") or "").strip()
-    if not answer_text and answer_keys:
-        answer_text = "、".join(sorted(answer_keys))
-
-    parts: list[str] = []
-    if answer_text:
-        parts.append(f"正确答案：{answer_text}")
-    explanation = str(record.get("explanation") or "").strip()
-    if explanation:
-        parts.append(f"解析：{explanation}")
-    return "\n".join(parts)
 
 
 def _mistake_keywords(record: dict, reference_answer: str) -> list[str]:
@@ -625,53 +604,260 @@ def _mistake_keywords(record: dict, reference_answer: str) -> list[str]:
     return keywords
 
 
-def _mistake_expression_question(record: dict, source: str) -> dict:
-    stem = re.sub(r"\s+", " ", str(record.get("stem") or "")).strip()
-    if not stem:
-        raise ExpressionError("这道错题缺少题干，暂时无法用于表达训练。")
-    if len(stem) > 360:
-        stem = stem[:360].rstrip() + "…"
+CHOICE_QUESTION_RE = re.compile(
+    r"(下列|以下|哪一?项|哪些|正确的是|错误的是|不正确|有误|判断题|选项\s*[A-D]|[A-D][.、．])",
+    re.IGNORECASE,
+)
 
-    reference_answer = _mistake_reference_answer(record)
-    if not reference_answer:
-        raise ExpressionError("这道错题还没有正确答案或解析，暂时无法生成参考表达。")
 
-    topic = str(record.get("topic") or "未分类").strip() or "未分类"
-    review_id = str(record.get("review_id") or "").strip()
+def _looks_like_choice_question(question: str) -> bool:
+    return bool(CHOICE_QUESTION_RE.search(question or ""))
+
+
+def _mistake_answer_text(record: dict) -> str:
+    """把正确选项还原成可朗读的文本，避免输出 A/B/C/D。"""
+    answer_keys = {
+        str(item).strip().upper()
+        for item in (record.get("correct_answer") or [])
+        if str(item).strip()
+    }
+    option_texts: list[str] = []
+    for option in record.get("options") or []:
+        if not isinstance(option, dict):
+            continue
+        key = str(option.get("key") or "").strip().upper()
+        text = str(option.get("text") or "").strip()
+        if key in answer_keys and text:
+            option_texts.append(text)
+    if option_texts:
+        return "、".join(option_texts)
+    text = str(record.get("correct_answer_text") or "").strip()
+    if text and text.upper() not in answer_keys:
+        return text
+    return "、".join(sorted(answer_keys))
+
+
+def _mistake_spoken_reference(records: list[dict]) -> str:
+    """不用 LLM 时，也从解析和正确选项文本拼出口语答案，不回显选项编号。"""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        explanation = str(record.get("explanation") or "").strip()
+        answer = _mistake_answer_text(record)
+        if explanation and answer and answer not in explanation:
+            sentence = f"{explanation} 核心结论是：{answer}。"
+        else:
+            sentence = explanation or (f"核心结论是：{answer}。" if answer else "")
+        normalized = _keyword_norm(sentence)
+        if not sentence or normalized in seen:
+            continue
+        seen.add(normalized)
+        parts.append(sentence)
+        if len(parts) >= 3:
+            break
+    return "\n".join(parts)
+
+
+def _mistake_open_question(topic: str) -> str:
+    return f"请结合你的理解，讲清楚「{topic}」的核心概念、关键区别和常见误区。"
+
+
+def _mistake_source_title(record: dict) -> str:
+    source_title = str(record.get("source_title") or "").strip()
+    if source_title:
+        return source_title
     lineage = record.get("source_lineage") if isinstance(record.get("source_lineage"), dict) else {}
-    paper_titles = [
+    for item in lineage.get("paper_doc_titles") or []:
+        title = str(item).strip()
+        if title:
+            return title
+    return ""
+
+
+def _mistake_group_records(record: dict) -> list[dict]:
+    """同一 topic_id 的错题只保留一组，避免同类知识点重复出题。"""
+    from . import review as review_service
+
+    topic_id = str(record.get("topic_id") or "").strip()
+    records = review_service.list_topic_records(topic_id) if topic_id else []
+    if not records:
+        records = [record]
+    usable = [
+        item
+        for item in records
+        if _mistake_answer_text(item)
+        or str(item.get("explanation") or "").strip()
+    ]
+    if not usable:
+        usable = [record]
+    usable.sort(
+        key=lambda item: int(item.get("updated_at") or item.get("created_at") or 0),
+        reverse=True,
+    )
+    return usable[:EXPRESSION_MISTAKE_MAX_RECORDS]
+
+
+def _generate_mistake_question_via_llm(
+    role_name: str,
+    topic: str,
+    records: list[dict],
+    question_type: str = "",
+) -> dict | None:
+    """把同知识点的一组错题改写成一道开放式问答题。"""
+    if not records:
+        return None
+    try:
+        raw = llm_service.chat_json(
+            prompts.EXPRESSION_MISTAKE_SYSTEM,
+            prompts.build_expression_mistake_user(role_name, topic, records),
+            max_tokens=1400,
+            timeout=EXPRESSION_GENERATE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    question = str(raw.get("question") or "").strip()
+    reference_answer = str(raw.get("reference_answer") or "").strip()
+    if not question or not reference_answer:
+        return None
+    # 模型偶尔仍会输出选择题口吻，这种结果直接丢弃并走兜底。
+    if _looks_like_choice_question(question):
+        return None
+    keywords = [
         str(item).strip()
-        for item in (lineage.get("paper_doc_titles") or [])
+        for item in (raw.get("keywords") or [])
         if str(item).strip()
     ]
-    source_title = str(record.get("source_title") or "").strip()
-    if not source_title and paper_titles:
-        source_title = paper_titles[0]
-
-    question = (
-        f"请把下面这道错题当成面试追问来讲清楚：{stem}\n"
-        "回答时先给结论，再解释正确答案为什么成立，最后说明这题最容易错在哪里。"
-    )
+    key_points = [
+        str(item).strip()
+        for item in (raw.get("standard_key_points") or [])
+        if str(item).strip()
+    ]
+    reference_script = str(raw.get("reference_script") or "").strip()
+    source_title = str(raw.get("source_title") or "").strip()
     return {
         "question": question,
-        "label": f"错题-{review_id[-8:] or '复盘'}",
+        "reference_answer": reference_answer,
+        "keywords": keywords[:8],
+        "standard_key_points": key_points[:5],
+        "reference_script": reference_script,
+        "source_title": source_title,
+        "question_type": "",
+    }
+
+
+def _mistake_expression_question(record: dict, source: str, role) -> dict:
+    topic = str(record.get("topic") or "未分类").strip() or "未分类"
+    review_id = str(record.get("review_id") or "").strip()
+    records = _mistake_group_records(record)
+    topic_id = str(record.get("topic_id") or "").strip()
+    group_ids = sorted(
+        str(item.get("review_id") or "")
+        for item in records
+        if str(item.get("review_id") or "")
+    )
+    fingerprint = hashlib.sha1("|".join(group_ids).encode("utf-8")).hexdigest()[:12]
+    cache_key = _generated_question_cache_key(
+        role.key,
+        topic,
+        [topic_id or fingerprint, fingerprint],
+        "",
+        "mistake",
+    )
+
+    payload = _load_generated_question(cache_key)
+    if not payload:
+        generated_queue = _get_or_start_generation(
+            cache_key,
+            role.name,
+            topic,
+            records,
+            "",
+            _generate_mistake_question_via_llm,
+        )
+        payload = _wait_for_generated_question(
+            generated_queue,
+            EXPRESSION_MISTAKE_FAST_WAIT_SECONDS,
+        )
+        if payload:
+            _save_generated_question(cache_key, payload)
+
+    generated_by_llm = payload is not None
+    if not payload:
+        reference_answer = _mistake_spoken_reference(records)
+        if not reference_answer:
+            raise ExpressionError("这组错题还没有可用的正确答案或解析，暂时无法生成问答题。")
+        payload = {
+            "question": _mistake_open_question(topic),
+            "reference_answer": reference_answer,
+            "keywords": _mistake_keywords(record, reference_answer),
+            "standard_key_points": [],
+            "reference_script": "",
+            "source_title": _mistake_source_title(record),
+            "question_type": "",
+        }
+
+    source_title = (
+        str(payload.get("source_title") or "").strip()
+        or _mistake_source_title(record)
+    )
+    keywords = [
+        str(item).strip()
+        for item in (payload.get("keywords") or [])
+        if str(item).strip()
+    ]
+    key_points = [
+        str(item).strip()
+        for item in (payload.get("standard_key_points") or [])
+        if str(item).strip()
+    ]
+    reference_script = str(payload.get("reference_script") or "").strip()
+    if not keywords or not key_points or not reference_script:
+        fallback_keywords, fallback_points, fallback_script = _speaking_materials(
+            payload["question"],
+            payload["reference_answer"],
+            keywords,
+            allow_llm=False,
+        )
+        keywords = keywords or fallback_keywords
+        key_points = key_points or fallback_points
+        reference_script = reference_script or fallback_script
+    _prefetch_speaking_materials(
+        payload["question"],
+        payload["reference_answer"],
+        keywords,
+    )
+
+    disclaimer = (
+        "本题由同一知识点下的错题经 AI 改写为问答题，只使用错题中已有的"
+        "正确答案与解析；表达训练不重新判定技术答案对错。"
+    )
+    if not generated_by_llm:
+        disclaimer = (
+            "AI 改写未在本次请求内完成，已先按知识点生成通用问答题，并只使用"
+            "错题中已有的正确答案与解析；稍后重新选择该知识点可获取 AI 改写版。"
+        )
+    return {
+        "question": payload["question"],
+        "label": f"合并{len(records)}题" if len(records) > 1 else "错题改写",
         "source": source_title,
         "section": topic,
         "topic_matched": True,
-        "generated_by_llm": False,
-        "disclaimer": (
-            "本题来自错题复盘，参考答案只引用该错题已有的正确答案与解析；"
-            "表达训练不重新判定技术答案对错。"
-        ),
-        "reference_answer": reference_answer,
-        "keywords": _mistake_keywords(record, reference_answer),
-        "standard_key_points": _fallback_key_points(reference_answer),
-        "reference_script": _fallback_reference_script(reference_answer),
+        "generated_by_llm": generated_by_llm,
+        "disclaimer": disclaimer,
+        "reference_answer": payload["reference_answer"],
+        "keywords": keywords[:8],
+        "standard_key_points": key_points[:5],
+        "reference_script": reference_script,
         "source_tag": source or "wrong_review",
         "source_type": "mistake",
         "source_ref": review_id,
-        "question_type": str(record.get("type") or ""),
+        "question_type": "",
         "source_title": source_title,
+        "group_size": len(records),
+        "group_topic": topic,
+        "related_review_ids": group_ids,
     }
 
 
@@ -746,7 +932,7 @@ def drill_question(
             record = review_service.get_record(source_ref)
         except review_service.ReviewError as exc:
             raise ExpressionError(str(exc)) from exc
-        payload = _mistake_expression_question(record, source)
+        payload = _mistake_expression_question(record, source, role)
         return {
             **payload,
             "role_key": role.key,

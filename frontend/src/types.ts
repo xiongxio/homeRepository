@@ -269,6 +269,9 @@ export interface ExpressionQuestion {
   source_ref?: string
   question_type?: string
   source_title?: string
+  group_size?: number
+  group_topic?: string
+  related_review_ids?: string[]
 }
 
 export interface ExpressionMetrics {

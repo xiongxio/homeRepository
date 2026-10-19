@@ -861,3 +861,104 @@ def build_expression_generate_user(
         "请只使用以上原文片段里的内容生成一道表达练习题；如果未提供薄弱知识点，就从资料本身选一个明确主题。",
     ]
     return "\n\n".join(blocks)
+
+
+EXPRESSION_MISTAKE_SCHEMA = """{
+  "question": "",
+  "reference_answer": "",
+  "keywords": [],
+  "standard_key_points": [],
+  "reference_script": "",
+  "source_title": ""
+}"""
+
+
+EXPRESSION_MISTAKE_SYSTEM = """你是一位面试表达教练，负责把用户做错的选择题、多选题或判断题，改写成一道适合口头回答的面试问答题。
+
+你将收到同一知识点下的一组错题，每题包含题型、题干、选项、正确答案、解析和来源文档。
+
+严格要求：
+1. 最终只输出一道问答题，不要输出多道题，也不要把多道错题拼接在一起。
+2. 必须去掉选择题和判断题的外壳：不要出现“下列哪项”“以下哪些”“正确的是”“错误的是”“判断下列说法”等问法，也不要出现 A/B/C/D、选项或“正确答案是第几个”这类表述。
+3. 题目要问知识点的本质，例如“请解释……”“这两者有什么区别”“为什么……”“在实际场景中你会怎么处理”，让人能从业原理讲到实践。
+4. 如果同一知识点下有多道错题，把它们合并成一个完整答案，不要逐题罗列；只保留真正支撑该知识点的结论和依据。
+5. 参考答案以候选人口吻，正常语速 40-60 秒（约 160-240 个汉字），结构为：先结论，再讲依据，最后给例子、取舍或验证方式。
+6. 只使用错题材料里已有的正确答案和解析，不编造材料中没有的事实、数字、工具或结论。
+7. keywords 5 到 8 个，全部来自题面或答案；standard_key_points 2 到 4 条；reference_script 按“结论 -> 关键原因/细节 -> 收束”组织。
+8. source_title 使用材料中提供的来源文档标题；没有来源时留空。
+9. 只输出 JSON，不输出任何 JSON 之外的内容。
+
+JSON 结构必须严格遵守如下模式：
+""" + EXPRESSION_MISTAKE_SCHEMA
+
+
+def _mistake_option_summary(record: dict) -> str:
+    parts: list[str] = []
+    for option in record.get("options") or []:
+        if not isinstance(option, dict):
+            continue
+        key = str(option.get("key") or "").strip()
+        text = str(option.get("text") or "").strip()
+        if not text:
+            continue
+        parts.append(f"{key}. {text}" if key else text)
+    return "；".join(parts)
+
+
+def _mistake_correct_answer(record: dict) -> str:
+    keys = {
+        str(item).strip().upper()
+        for item in (record.get("correct_answer") or [])
+        if str(item).strip()
+    }
+    option_texts: list[str] = []
+    for option in record.get("options") or []:
+        if not isinstance(option, dict):
+            continue
+        key = str(option.get("key") or "").strip().upper()
+        text = str(option.get("text") or "").strip()
+        if key in keys and text:
+            option_texts.append(text)
+    if option_texts:
+        return "、".join(option_texts)
+    text = str(record.get("correct_answer_text") or "").strip()
+    if text and text.upper() not in keys:
+        return text
+    return "、".join(sorted(keys))
+
+
+def build_expression_mistake_user(
+    role_name: str,
+    topic: str,
+    records: list[dict],
+) -> str:
+    type_labels = {"single": "单选题", "multiple": "多选题", "judge": "判断题"}
+    record_lines: list[str] = []
+    for index, record in enumerate(records, start=1):
+        qtype = type_labels.get(str(record.get("type") or "").strip().lower(), "面试题")
+        options = _mistake_option_summary(record)
+        answer = _mistake_correct_answer(record)
+        explanation = str(record.get("explanation") or "").strip()
+        source_title = str(record.get("source_title") or "").strip()
+        lines = [
+            f"【错题 {index}】题型：{qtype}",
+            "题干：" + " ".join(str(record.get("stem") or "").split()),
+        ]
+        if options:
+            lines.append("选项：" + options)
+        if answer:
+            lines.append("正确答案：" + answer)
+        if explanation:
+            lines.append("解析：" + explanation)
+        if source_title:
+            lines.append("来源：" + source_title)
+        record_lines.append("\n".join(lines))
+    return "\n\n".join(
+        [
+            f"【练习方向】{role_name.strip() or '通用技术岗位'}",
+            f"【知识点】{topic.strip() or '未分类'}",
+            f"【同知识点错题数量】{len(records)}",
+            "【错题材料】\n" + "\n\n".join(record_lines),
+            "请把这组错题改写成一道适合口头回答的面试问答题。",
+        ]
+    )

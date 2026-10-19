@@ -332,15 +332,62 @@ class ReviewScheduleTests(unittest.TestCase):
             expression_service.SPEAKING_MATERIAL_CACHE_DIR = originals["material_dir"]
             expression_service.GENERATED_QUESTION_CACHE_DIR = originals["generated_dir"]
 
-    def test_expression_question_can_use_wrong_review_record_as_source(self):
-        question = self._question()
-        review_service.sync_wrong_answers([question], self._paper([question]))
+    def test_expression_question_merges_same_topic_mistakes_into_one_open_question(self):
+        first = self._question()
+        second = self._question(
+            stem="Chunk overlap 越大越好。",
+            correct="B",
+        )
+        second.update(
+            {
+                "type": "judge",
+                "options": [
+                    {"key": "A", "text": "正确"},
+                    {"key": "B", "text": "错误"},
+                ],
+                "explanation": "Overlap 过大会增加重复内容。",
+            }
+        )
+        review_service.sync_wrong_answers(
+            [first, second],
+            self._paper([first, second]),
+        )
         review_id = review_service.list_records()[0]["review_id"]
+        fake_payload = {
+            "question": "在实际切分文档时，你会如何设置 chunk overlap，为什么？",
+            "reference_answer": "我会保留适度重叠，避免语义被边界切断，同时控制重复内容。",
+            "keywords": ["chunk overlap", "边界切断", "重复内容"],
+            "standard_key_points": ["适度重叠", "控制重复内容"],
+            "reference_script": "结论先行：我会保留适度重叠，再说明原因和取舍。",
+            "source_title": "RAG 讲义",
+        }
+        captured = {}
 
-        with patch(
-            "backend.app.services.question_bank.load_role_questions",
-            return_value=[],
-        ) as load_bank:
+        def fake_generate(role_name, topic, records, question_type=""):
+            captured["records"] = records
+            return fake_payload
+
+        expression_dir = self.data_dir / "expression"
+        with (
+            patch.object(
+                expression_service,
+                "GENERATED_QUESTION_CACHE_DIR",
+                expression_dir / "generated_questions",
+            ),
+            patch.object(
+                expression_service,
+                "_prefetch_speaking_materials",
+            ),
+            patch.object(
+                expression_service,
+                "_generate_mistake_question_via_llm",
+                side_effect=fake_generate,
+            ),
+            patch(
+                "backend.app.services.question_bank.load_role_questions",
+                return_value=[],
+            ) as load_bank,
+        ):
             result = expression_service.drill_question(
                 "ai_app_dev",
                 "RAG 分块",
@@ -353,11 +400,54 @@ class ReviewScheduleTests(unittest.TestCase):
         load_bank.assert_not_called()
         self.assertEqual("mistake", result["source_type"])
         self.assertEqual(review_id, result["source_ref"])
-        self.assertIn(question["stem"], result["question"])
-        self.assertIn("正确答案：B. 避免上下文被边界切断", result["reference_answer"])
-        self.assertIn("Overlap 让相邻块保留重叠内容。", result["reference_answer"])
+        self.assertEqual(2, result["group_size"])
+        self.assertEqual("RAG 分块", result["group_topic"])
+        self.assertEqual(fake_payload["question"], result["question"])
+        self.assertNotRegex(result["question"], r"(下列|哪项|正确的是|判断题)")
+        self.assertEqual(2, len(captured["records"]))
         self.assertEqual("RAG 讲义", result["source_title"])
         self.assertEqual("RAG 分块", result["section"])
+
+    def test_mistake_expression_fallback_uses_open_question_without_options(self):
+        question = self._question()
+        review_service.sync_wrong_answers([question], self._paper([question]))
+        review_id = review_service.list_records()[0]["review_id"]
+        expression_dir = self.data_dir / "expression"
+
+        with (
+            patch.object(
+                expression_service,
+                "GENERATED_QUESTION_CACHE_DIR",
+                expression_dir / "generated_questions",
+            ),
+            patch.object(
+                expression_service,
+                "SPEAKING_MATERIAL_CACHE_DIR",
+                expression_dir / "materials",
+            ),
+            patch.object(expression_service, "_prefetch_speaking_materials"),
+            patch.object(
+                expression_service,
+                "_generate_mistake_question_via_llm",
+                return_value=None,
+            ),
+        ):
+            result = expression_service.drill_question(
+                "ai_app_dev",
+                "RAG 分块",
+                [],
+                "wrong_review",
+                "mistake",
+                review_id,
+            )
+
+        self.assertFalse(result["generated_by_llm"])
+        self.assertIn("请结合你的理解", result["question"])
+        self.assertIn("RAG 分块", result["question"])
+        self.assertNotRegex(result["question"], r"(下列|哪项|正确的是|判断题)")
+        self.assertIn("Overlap 让相邻块保留重叠内容。", result["reference_answer"])
+        self.assertIn("避免上下文被边界切断", result["reference_answer"])
+        self.assertNotIn("B.", result["reference_answer"])
 
     def test_expression_question_rejects_missing_wrong_review_record(self):
         with self.assertRaisesRegex(
