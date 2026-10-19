@@ -99,7 +99,16 @@ def _provider_config(provider: str | None = None) -> tuple[str, str, str]:
     raise LlmError(f"不支持的 LLM_PROVIDER: {provider}")
 
 
-def _completion(client: OpenAI, *, model: str, messages: list[dict], temperature: float, max_tokens: int, json_mode: bool):
+def _completion(
+    client: OpenAI,
+    *,
+    model: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool,
+    max_attempts: int = _COMPLETION_MAX_ATTEMPTS,
+):
     kwargs = {
         "model": model,
         "messages": messages,
@@ -110,8 +119,8 @@ def _completion(client: OpenAI, *, model: str, messages: list[dict], temperature
     if use_json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     last_exc: Exception | None = None
-    for attempt in range(_COMPLETION_MAX_ATTEMPTS):
-        is_last = attempt + 1 >= _COMPLETION_MAX_ATTEMPTS
+    for attempt in range(max_attempts):
+        is_last = attempt + 1 >= max_attempts
         try:
             return client.chat.completions.create(**kwargs)
         except Exception as exc:
@@ -137,7 +146,7 @@ def _completion(client: OpenAI, *, model: str, messages: list[dict], temperature
                 llm_logger.warning(
                     "transient LLM error attempt=%d/%d type=%s backoff=%.1fs err=%s",
                     attempt + 1,
-                    _COMPLETION_MAX_ATTEMPTS,
+                    max_attempts,
                     type(exc).__name__,
                     backoff,
                     str(exc)[:200],
@@ -213,6 +222,7 @@ def chat_json(
     provider: str | None = None,
     model: str | None = None,
     timeout: float | None = None,
+    max_attempts: int = _COMPLETION_MAX_ATTEMPTS,
 ) -> dict:
     api_key, base_url, resolved_model = _provider_config(provider)
     provider_name = provider or settings.llm_provider
@@ -252,6 +262,7 @@ def chat_json(
                 temperature=0.3 if attempt == 0 else 0.2,
                 max_tokens=max_tokens,
                 json_mode=True,
+                max_attempts=max_attempts,
             )
         except Exception as exc:
             raise LlmError(_classify_upstream_error(exc) or f"调用 LLM 失败: {exc}") from exc

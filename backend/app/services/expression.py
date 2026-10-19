@@ -680,7 +680,7 @@ def _save_generated_question(cache_key: str, payload: dict) -> None:
         pass
 
 
-EXPRESSION_GENERATE_TIMEOUT_SECONDS = 45.0
+EXPRESSION_GENERATE_TIMEOUT_SECONDS = 120.0
 
 
 def _wait_for_generated_question(queue: Queue, timeout: float) -> dict | None:
@@ -1137,6 +1137,7 @@ def _generate_question_via_llm(
             ),
             max_tokens=1200,
             timeout=EXPRESSION_GENERATE_TIMEOUT_SECONDS,
+            max_attempts=1,
         )
     except Exception as exc:
         message = str(exc).strip() or "模型调用失败。"
