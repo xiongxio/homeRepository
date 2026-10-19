@@ -96,6 +96,8 @@ const REVIEW_RANGES: Array<{
   { key: '30d', label: '近1月', days: 30 },
 ]
 
+const KNOWLEDGE_POOL_LIMIT = 5
+
 type ReviewRangeKey = (typeof REVIEW_RANGES)[number]['key']
 
 // 复盘记录的时间戳由后端以秒返回，统一转成毫秒后再比较和格式化。
@@ -297,6 +299,20 @@ interface ExpressionSourceContext {
   questionType: string
 }
 
+interface KnowledgePoolState {
+  questions: ExpressionQuestion[]
+  index: number
+  exhausted: boolean
+  message: string
+}
+
+const EMPTY_KNOWLEDGE_POOL: KnowledgePoolState = {
+  questions: [],
+  index: 0,
+  exhausted: false,
+  message: '',
+}
+
 function emptySourceContext(): ExpressionSourceContext {
   return {
     docIds: [],
@@ -311,6 +327,10 @@ function normalizeSourceType(value: string): ExpressionSourceType {
   return value === 'knowledge' || value === 'mistake' || value === 'resume'
     ? value
     : 'bank'
+}
+
+function knowledgeSignature(docIds: string[], questionType: string): string {
+  return `${[...docIds].sort().join('|')}::${questionType || 'any'}`
 }
 
 export function ExpressionDrill({
@@ -352,6 +372,9 @@ export function ExpressionDrill({
   const [reviewSearch, setReviewSearch] = useState('')
   const [reviewRange, setReviewRange] = useState<ReviewRangeKey>('all')
   const [reviewPickerOpen, setReviewPickerOpen] = useState(!seedSourceRef)
+  const [generatedKnowledgeSignature, setGeneratedKnowledgeSignature] = useState('')
+  const [knowledgePool, setKnowledgePool] =
+    useState<KnowledgePoolState>(EMPTY_KNOWLEDGE_POOL)
   const [resumeRecord, setResumeRecord] = useState<ResumeRecord | null>(activeResume)
   const timerRef = useRef<number | null>(null)
   const seededTokenRef = useRef(seedToken)
@@ -401,6 +424,20 @@ export function ExpressionDrill({
       ) ?? null,
     [reviewGroups, selectedReviewId],
   )
+  const currentKnowledgeSignature = knowledgeSignature(selectedDocIds, questionType)
+  const knowledgeSelectionDirty =
+    sourceType === 'knowledge' &&
+    Boolean(question) &&
+    generatedKnowledgeSignature !== '' &&
+    generatedKnowledgeSignature !== currentKnowledgeSignature
+  const knowledgePoolAtEnd =
+    sourceType === 'knowledge' &&
+    knowledgePool.questions.length > 0 &&
+    knowledgePool.index >= knowledgePool.questions.length - 1
+  const knowledgeGroupFull =
+    knowledgePool.exhausted &&
+    knowledgePool.questions.length >= KNOWLEDGE_POOL_LIMIT &&
+    generatedKnowledgeSignature === currentKnowledgeSignature
   const [mediaSupported] = useState(
     () =>
       typeof navigator !== 'undefined' &&
@@ -478,7 +515,12 @@ export function ExpressionDrill({
   )
 
   const loadQuestion = useCallback(
-    async (key: string, hint = '', source?: ExpressionSourceContext) => {
+    async (
+      key: string,
+      hint = '',
+      source?: ExpressionSourceContext,
+      nonce = '',
+    ) => {
       const activeSource = source ?? activeSourceRef.current
       answerRoundRef.current += 1
       const round = answerRoundRef.current
@@ -504,8 +546,22 @@ export function ExpressionDrill({
           activeSource.sourceType,
           activeSource.sourceRef,
           activeSource.questionType,
+          nonce,
         )
         setQuestion(nextQuestion)
+        if (activeSource.sourceType === 'knowledge') {
+          setKnowledgePool({
+            questions: nextQuestion.pool_questions ?? [],
+            index: Math.max(0, (nextQuestion.pool_index ?? 1) - 1),
+            exhausted: Boolean(nextQuestion.pool_exhausted),
+            message: nextQuestion.pool_message ?? '',
+          })
+          setGeneratedKnowledgeSignature(
+            knowledgeSignature(activeSource.docIds, activeSource.questionType),
+          )
+        } else {
+          setKnowledgePool(EMPTY_KNOWLEDGE_POOL)
+        }
         if (nextQuestion.generation_pending) {
           scheduleMistakeRefresh(key, hint, activeSource, round)
         }
@@ -619,9 +675,9 @@ export function ExpressionDrill({
     return { ...source, ...next }
   }
 
-  const reloadWithSource = (source: ExpressionSourceContext) => {
+  const reloadWithSource = (source: ExpressionSourceContext, nonce = '') => {
     activeSourceRef.current = source
-    void loadQuestion(roleKey, topicHint, source)
+    void loadQuestion(roleKey, topicHint, source, nonce)
   }
 
   const changeSourceType = (next: ExpressionSourceType) => {
@@ -643,10 +699,17 @@ export function ExpressionDrill({
               : '',
       questionType,
     }
-    if (next === 'knowledge' && selectedDocIds.length === 0) {
+    if (next === 'knowledge') {
       activeSourceRef.current = source
       setQuestion(null)
-      setError('请先勾选至少一份知识库文档，再开始训练。')
+      setTopicHint('')
+      setKnowledgePool(EMPTY_KNOWLEDGE_POOL)
+      setGeneratedKnowledgeSignature('')
+      setError(
+        selectedDocIds.length === 0
+          ? '请先勾选至少一份知识库文档，再点「生成 1 道表达题」。'
+          : '',
+      )
       return
     }
     if (next === 'mistake' && !nextReviewId) {
@@ -672,10 +735,15 @@ export function ExpressionDrill({
     if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
     const source = buildSourceContext({ questionType: next })
     setQuestionType(next)
-    if (source.sourceType === 'knowledge' && source.docIds.length === 0) {
+    if (source.sourceType === 'knowledge') {
       activeSourceRef.current = source
-      setQuestion(null)
-      setError('请先勾选至少一份知识库文档，再选择题型。')
+      setKnowledgePool(EMPTY_KNOWLEDGE_POOL)
+      if (source.docIds.length === 0) {
+        setQuestion(null)
+        setError('请先勾选至少一份知识库文档，再选择题型。')
+      } else {
+        setError('')
+      }
       return
     }
     if (source.sourceType === 'mistake' && !source.sourceRef) {
@@ -694,22 +762,76 @@ export function ExpressionDrill({
   }
 
   const toggleDocument = (docId: string) => {
+    if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
     const next = selectedDocIds.includes(docId)
       ? selectedDocIds.filter((item) => item !== docId)
       : [...selectedDocIds, docId]
     setSelectedDocIds(next)
-    const source = buildSourceContext({
+    if (sourceType !== 'knowledge') return
+    activeSourceRef.current = buildSourceContext({
       docIds: next,
       sourceRef: next.join('|'),
     })
-    if (sourceType !== 'knowledge') return
+    setKnowledgePool(EMPTY_KNOWLEDGE_POOL)
     if (next.length === 0) {
-      activeSourceRef.current = source
       setQuestion(null)
       setError('请至少选择一份知识库文档。')
       return
     }
-    reloadWithSource(source)
+    setError('')
+  }
+
+  const applyKnowledgeQuestion = (index: number) => {
+    const nextQuestion = knowledgePool.questions[index]
+    if (!nextQuestion) return
+    answerRoundRef.current += 1
+    cancelActiveRecording()
+    setSession(null)
+    setTranscript('')
+    setElapsed(0)
+    setPreviousSessionId('')
+    setRetryMissedPoints([])
+    setError('')
+    setQuestion(nextQuestion)
+    setKnowledgePool((prev) => ({ ...prev, index }))
+  }
+
+  const generateKnowledgeQuestion = () => {
+    if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
+    if (selectedDocIds.length === 0) {
+      setError('请先勾选至少一份知识库文档，再生成表达题。')
+      return
+    }
+    const signature = knowledgeSignature(selectedDocIds, questionType)
+    if (knowledgePool.exhausted && generatedKnowledgeSignature === signature) {
+      setError(knowledgePool.message || '本组已练完，换文档或题型开始新一组。')
+      return
+    }
+    const source = buildSourceContext()
+    activeSourceRef.current = source
+    reloadWithSource(
+      source,
+      `gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    )
+  }
+
+  const nextKnowledgeQuestion = () => {
+    if (sourceType !== 'knowledge') return
+    const nextIndex = knowledgePool.index + 1
+    if (nextIndex < knowledgePool.questions.length) {
+      applyKnowledgeQuestion(nextIndex)
+      return
+    }
+    if (knowledgePool.exhausted) {
+      setError(knowledgePool.message || '本组已练完，换文档或题型开始新一组。')
+      return
+    }
+    generateKnowledgeQuestion()
+  }
+
+  const replayKnowledgePool = () => {
+    if (knowledgePool.questions.length === 0) return
+    applyKnowledgeQuestion(0)
   }
 
   const changeReviewRecord = (reviewId: string) => {
@@ -766,6 +888,10 @@ export function ExpressionDrill({
   const nextQuestionFromStart = () => {
     setHintMode('read')
     window.localStorage.setItem('opc-expression-hint-mode', 'read')
+    if (sourceType === 'knowledge') {
+      nextKnowledgeQuestion()
+      return
+    }
     void loadQuestion(roleKey, topicHint)
   }
 
@@ -1106,6 +1232,56 @@ export function ExpressionDrill({
                   ))}
                 </div>
               )}
+              <div className="mt-2 flex flex-wrap items-center gap-3 rounded-lg border border-emerald-200 bg-emerald-50/60 px-3 py-2.5">
+                <span className="text-xs font-medium text-emerald-900">
+                  已选 {selectedDocIds.length} 份文档
+                </span>
+                <button
+                  type="button"
+                  className="primary-btn"
+                  onClick={generateKnowledgeQuestion}
+                  disabled={
+                    selectedDocIds.length === 0 ||
+                    Boolean(busy) ||
+                    knowledgeGroupFull
+                  }
+                >
+                  {busy === 'question' ? (
+                    <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <ListChecks className="size-4" aria-hidden="true" />
+                  )}
+                  {knowledgeGroupFull
+                    ? '本组已满 5 道'
+                    : busy === 'question'
+                      ? '正在生成'
+                      : '生成 1 道表达题'}
+                </button>
+                {knowledgePool.questions.length > 0 && (
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    onClick={replayKnowledgePool}
+                    disabled={Boolean(busy)}
+                  >
+                    重练本组
+                  </button>
+                )}
+                <span className="text-xs text-zinc-500">
+                  本组已生成 {knowledgePool.questions.length}/
+                  {KNOWLEDGE_POOL_LIMIT} 道
+                </span>
+              </div>
+              {knowledgeSelectionDirty && (
+                <p className="mt-1 text-xs leading-5 text-amber-700">
+                  勾选或题型已变更，点「生成 1 道表达题」后生效。
+                </p>
+              )}
+              {knowledgePool.exhausted && (
+                <p className="mt-1 text-xs leading-5 text-amber-700">
+                  {knowledgePool.message || '本组已练完，换文档或题型开始新一组。'}
+                </p>
+              )}
             </div>
           )}
 
@@ -1257,31 +1433,33 @@ export function ExpressionDrill({
           )}
         </div>
 
-        <div className="mt-4">
-          <label className="field-label" htmlFor="expression-role">
-            练习方向
-          </label>
-          <select
-            id="expression-role"
-            className="text-input disabled:cursor-not-allowed disabled:bg-zinc-50 disabled:text-zinc-400"
-            value={roleKey}
-            onChange={(event) => chooseRole(event.target.value)}
-            disabled={roles.length === 0 || Boolean(busy)}
-          >
-            {roles.length === 0 ? (
-              <option value="">岗位加载中...</option>
-            ) : (
-              roles.map((role) => (
-                <option key={role.key} value={role.key}>
-                  {role.name}
-                </option>
-              ))
-            )}
-          </select>
-          <p className="mt-2 text-xs leading-5 text-zinc-500">
-            {roles.find((role) => role.key === roleKey)?.summary ?? '正在加载练习方向。'}
-          </p>
-        </div>
+        {sourceType !== 'knowledge' && (
+          <div className="mt-4">
+            <label className="field-label" htmlFor="expression-role">
+              练习方向
+            </label>
+            <select
+              id="expression-role"
+              className="text-input disabled:cursor-not-allowed disabled:bg-zinc-50 disabled:text-zinc-400"
+              value={roleKey}
+              onChange={(event) => chooseRole(event.target.value)}
+              disabled={roles.length === 0 || Boolean(busy)}
+            >
+              {roles.length === 0 ? (
+                <option value="">岗位加载中...</option>
+              ) : (
+                roles.map((role) => (
+                  <option key={role.key} value={role.key}>
+                    {role.name}
+                  </option>
+                ))
+              )}
+            </select>
+            <p className="mt-2 text-xs leading-5 text-zinc-500">
+              {roles.find((role) => role.key === roleKey)?.summary ?? '正在加载练习方向。'}
+            </p>
+          </div>
+        )}
       </section>
 
       <section className="tool-card">
@@ -1291,12 +1469,22 @@ export function ExpressionDrill({
               {question
                 ? question.source_type === 'mistake'
                   ? `知识点表达训练 ${question.label || ''}`
-                  : `真题编号 ${question.label || '未编号'}`
-                : '选好岗位后取一道真题开始'}
+                  : question.source_type === 'knowledge'
+                    ? `知识点表达训练 ${question.label || ''}${
+                        knowledgePool.questions.length > 0
+                          ? ` · 第 ${knowledgePool.index + 1}/${knowledgePool.questions.length} 道`
+                          : ''
+                      }`
+                    : `真题编号 ${question.label || '未编号'}`
+                : sourceType === 'knowledge'
+                  ? '勾选文档后点「生成 1 道表达题」开始'
+                  : '选好岗位后取一道真题开始'}
             </p>
             <p className="mt-1.5 text-[15px] font-medium leading-7 text-zinc-900">
               {question?.question ??
-                '点击右侧按钮，从你的真实面试题库里抽一道表达练习题。'}
+                (sourceType === 'knowledge'
+                  ? '先在上方勾选知识库文档，再点「生成 1 道表达题」。'
+                  : '点击右侧按钮，从你的真实面试题库里抽一道表达练习题。')}
             </p>
             {question?.source && (
               <p className="mt-1 text-xs leading-5 text-zinc-500">
@@ -1317,11 +1505,12 @@ export function ExpressionDrill({
             {question?.source_tag === 'quiz_dashboard' && (
               <p className="mt-1 text-xs font-medium text-zinc-600">来自在线刷题</p>
             )}
-            {question?.topic_matched === false && (
+            {question?.source_type !== 'knowledge' &&
+              question?.topic_matched === false && (
               <p className="mt-1 text-xs leading-5 text-amber-700">
                 真题库里暂未找到完全匹配的题，已选择一道最接近该知识点的真题。
               </p>
-            )}
+              )}
             {question?.disclaimer && (
               <p className="mt-1 text-xs leading-5 text-amber-700">
                 {question.disclaimer}
@@ -1350,15 +1539,30 @@ export function ExpressionDrill({
             <button
               type="button"
               className="secondary-btn shrink-0"
-              onClick={() => void loadQuestion(roleKey, topicHint)}
-              disabled={Boolean(busy)}
+              onClick={() => {
+                if (question?.source_type === 'knowledge') {
+                  nextKnowledgeQuestion()
+                  return
+                }
+                void loadQuestion(roleKey, topicHint)
+              }}
+              disabled={
+                Boolean(busy) ||
+                (question?.source_type === 'knowledge' &&
+                  knowledgePoolAtEnd &&
+                  knowledgePool.exhausted)
+              }
             >
               {busy === 'question' ? (
                 <Loader2 className="size-4 animate-spin" aria-hidden="true" />
               ) : (
                 <RefreshCw className="size-4" aria-hidden="true" />
               )}
-              换一题
+              {question?.source_type === 'knowledge' &&
+              knowledgePoolAtEnd &&
+              knowledgePool.exhausted
+                ? '本组已练完'
+                : '换一题'}
             </button>
           )}
         </div>
@@ -1366,6 +1570,7 @@ export function ExpressionDrill({
         {topicHint && (
           <p
             className={`mt-2 rounded-lg border px-3 py-2 text-xs leading-5 ${
+              question?.source_type !== 'knowledge' &&
               question?.topic_matched === false
                 ? 'border-amber-200 bg-amber-50 text-amber-800'
                 : 'border-sky-100 bg-sky-50 text-sky-800'
@@ -1381,9 +1586,11 @@ export function ExpressionDrill({
                       ? `，${question.group_size} 道错题已合并为一道问答题`
                       : ''
                   }。`
-                : question?.topic_matched === false
-                ? `真题库里暂时没有匹配「${topicHint}」的题，已选择最接近的一道真题。练习方向仍按薄弱知识点定位；导入相关真题库后会优先命中。`
-                : `已定位薄弱知识点：${topicHint}。本题来自相关真题。`}
+                : question?.source_type === 'knowledge'
+                  ? `已根据所选知识库文档生成题目。`
+                  : question?.topic_matched === false
+                    ? `真题库里暂时没有匹配「${topicHint}」的题，已选择最接近的一道真题。练习方向仍按薄弱知识点定位；导入相关真题库后会优先命中。`
+                    : `已定位薄弱知识点：${topicHint}。本题来自相关真题。`}
           </p>
         )}
 

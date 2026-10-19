@@ -846,6 +846,7 @@ def build_expression_generate_user(
     topic_hint: str,
     source_chunks: list[dict],
     question_type: str = "",
+    existing_questions: list[str] | None = None,
 ) -> str:
     chunk_lines = []
     for index, chunk in enumerate(source_chunks, start=1):
@@ -855,13 +856,33 @@ def build_expression_generate_user(
         chunk_lines.append(
             f"【资料片段 {index}】标题：{title or '未命名'}（doc_id={doc_id}）\n{text[:900]}"
         )
-    blocks = [
-        f"【练习方向】{role_name}",
-        f"【薄弱知识点】{topic_hint.strip()}",
-        f"【题型】{question_type.strip() or '不限，选择最适合原文的表达角度'}",
-        "【资料原文片段】\n" + "\n\n".join(chunk_lines) if chunk_lines else "（无可用原文片段）",
-        "请只使用以上原文片段里的内容生成一道表达练习题；如果未提供薄弱知识点，就从资料本身选一个明确主题。",
-    ]
+    blocks: list[str] = []
+    if role_name.strip():
+        blocks.append(f"【练习方向】{role_name.strip()}")
+    blocks.extend(
+        [
+            "【薄弱知识点】"
+            + (topic_hint.strip() or "（未指定，从资料本身选一个明确主题）"),
+            f"【题型】{question_type.strip() or '不限，选择最适合原文的表达角度'}",
+            "【资料原文片段】\n" + "\n\n".join(chunk_lines)
+            if chunk_lines
+            else "（无可用原文片段）",
+        ]
+    )
+    if existing_questions:
+        question_lines = "\n".join(
+            f"{index}. {question.strip()}"
+            for index, question in enumerate(existing_questions, start=1)
+            if str(question).strip()
+        )
+        if question_lines:
+            blocks.append(
+                "【已生成题目】请避开以下题目，不要换说法重复：\n" + question_lines
+            )
+    blocks.append(
+        "请只使用以上原文片段里的内容生成一道表达练习题；"
+        "如果未提供薄弱知识点，就从资料本身选一个明确主题。"
+    )
     return "\n\n".join(blocks)
 
 

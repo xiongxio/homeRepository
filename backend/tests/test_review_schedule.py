@@ -8,6 +8,7 @@ from pathlib import Path
 from queue import Queue
 from unittest.mock import patch
 
+from backend.app import prompts
 from backend.app.services import quiz as quiz_service
 from backend.app.services import review as review_service
 from backend.app.services import expression as expression_service
@@ -547,6 +548,253 @@ class ReviewScheduleTests(unittest.TestCase):
                 "mistake",
                 "rv_missing",
             )
+
+    def test_knowledge_question_pool_caps_at_five(self):
+        expression_dir = self.data_dir / "expression"
+        calls = {"count": 0}
+
+        def fake_generate(
+            role_name,
+            topic_hint,
+            chunks,
+            question_type="",
+            existing_questions=None,
+        ):
+            calls["count"] += 1
+            index = calls["count"]
+            return {
+                "question": f"请解释知识点 {index} 的核心原理？",
+                "reference_answer": f"第 {index} 个知识点的结论和依据。",
+                "keywords": [f"知识点{index}"],
+                "standard_key_points": [f"要点{index}"],
+                "reference_script": f"结论{index}。",
+                "source_title": "测试文档",
+            }
+
+        with (
+            patch.object(
+                expression_service,
+                "GENERATED_QUESTION_CACHE_DIR",
+                expression_dir / "generated_questions",
+            ),
+            patch.object(
+                expression_service,
+                "SPEAKING_MATERIAL_CACHE_DIR",
+                expression_dir / "materials",
+            ),
+            patch.object(
+                expression_service,
+                "KNOWLEDGE_POOL_DIR",
+                expression_dir / "knowledge_pools",
+            ),
+            patch.object(expression_service, "_prefetch_speaking_materials"),
+            patch.object(
+                expression_service,
+                "_search_chunks_for_topic",
+                return_value=[
+                    {"doc_id": "doc_x", "title": "测试文档", "text": "知识点内容"}
+                ],
+            ),
+            patch.object(
+                expression_service,
+                "_generate_question_via_llm",
+                side_effect=fake_generate,
+            ),
+        ):
+            results = [
+                expression_service.drill_question(
+                    "ai_app_dev",
+                    "知识点",
+                    ["doc_x"],
+                    "knowledge",
+                    "knowledge",
+                    "",
+                    "concept",
+                    f"n{index}",
+                )
+                for index in range(1, 6)
+            ]
+            sixth = expression_service.drill_question(
+                "ai_app_dev",
+                "知识点",
+                ["doc_x"],
+                "knowledge",
+                "knowledge",
+                "",
+                "concept",
+                "n6",
+            )
+
+        self.assertEqual(5, calls["count"])
+        self.assertEqual([1, 2, 3, 4, 5], [item["pool_index"] for item in results])
+        self.assertTrue(all(item["pool_exhausted"] is False for item in results))
+        self.assertTrue(sixth["pool_exhausted"])
+        self.assertEqual(5, len(sixth["pool_questions"]))
+        self.assertEqual(5, sixth["pool_index"])
+        self.assertIn("已生成 5 道", sixth["pool_message"])
+
+    def test_knowledge_question_pool_does_not_count_duplicate(self):
+        expression_dir = self.data_dir / "expression"
+
+        def fake_generate(
+            role_name,
+            topic_hint,
+            chunks,
+            question_type="",
+            existing_questions=None,
+        ):
+            return {
+                "question": "请解释 RAG 分块的核心作用？",
+                "reference_answer": "分块是为了控制上下文长度，同时保留语义完整。",
+                "keywords": ["RAG", "分块"],
+                "standard_key_points": ["控制上下文长度"],
+                "reference_script": "结论先行。",
+                "source_title": "测试文档",
+            }
+
+        with (
+            patch.object(
+                expression_service,
+                "GENERATED_QUESTION_CACHE_DIR",
+                expression_dir / "generated_questions",
+            ),
+            patch.object(
+                expression_service,
+                "SPEAKING_MATERIAL_CACHE_DIR",
+                expression_dir / "materials",
+            ),
+            patch.object(
+                expression_service,
+                "KNOWLEDGE_POOL_DIR",
+                expression_dir / "knowledge_pools",
+            ),
+            patch.object(expression_service, "_prefetch_speaking_materials"),
+            patch.object(
+                expression_service,
+                "_search_chunks_for_topic",
+                return_value=[
+                    {"doc_id": "doc_x", "title": "测试文档", "text": "RAG 分块"}
+                ],
+            ),
+            patch.object(
+                expression_service,
+                "_generate_question_via_llm",
+                side_effect=fake_generate,
+            ),
+        ):
+            first = expression_service.drill_question(
+                "ai_app_dev",
+                "知识点",
+                ["doc_x"],
+                "knowledge",
+                "knowledge",
+                "",
+                "concept",
+                "n1",
+            )
+            second = expression_service.drill_question(
+                "ai_app_dev",
+                "知识点",
+                ["doc_x"],
+                "knowledge",
+                "knowledge",
+                "",
+                "concept",
+                "n2",
+            )
+
+        self.assertFalse(first["pool_exhausted"])
+        self.assertTrue(second["pool_exhausted"])
+        self.assertEqual(1, len(second["pool_questions"]))
+        self.assertIn("覆盖得差不多", second["pool_message"])
+
+    def test_knowledge_pool_is_shared_across_roles(self):
+        expression_dir = self.data_dir / "expression"
+        calls = {"count": 0}
+
+        def fake_generate(
+            role_name,
+            topic_hint,
+            chunks,
+            question_type="",
+            existing_questions=None,
+        ):
+            calls["count"] += 1
+            return {
+                "question": "请解释知识点的核心原理？",
+                "reference_answer": "先给结论，再说明依据。",
+                "keywords": ["知识点"],
+                "standard_key_points": ["核心原理"],
+                "reference_script": "结论先行。",
+                "source_title": "测试文档",
+            }
+
+        with (
+            patch.object(
+                expression_service,
+                "GENERATED_QUESTION_CACHE_DIR",
+                expression_dir / "generated_questions",
+            ),
+            patch.object(
+                expression_service,
+                "SPEAKING_MATERIAL_CACHE_DIR",
+                expression_dir / "materials",
+            ),
+            patch.object(
+                expression_service,
+                "KNOWLEDGE_POOL_DIR",
+                expression_dir / "knowledge_pools",
+            ),
+            patch.object(expression_service, "_prefetch_speaking_materials"),
+            patch.object(
+                expression_service,
+                "_search_chunks_for_topic",
+                return_value=[
+                    {"doc_id": "doc_x", "title": "测试文档", "text": "知识点内容"}
+                ],
+            ),
+            patch.object(
+                expression_service,
+                "_generate_question_via_llm",
+                side_effect=fake_generate,
+            ),
+        ):
+            first = expression_service.drill_question(
+                "ai_app_dev",
+                "知识点",
+                ["doc_x"],
+                "knowledge",
+                "knowledge",
+                "",
+                "concept",
+                "same-nonce",
+            )
+            second = expression_service.drill_question(
+                "software_qa",
+                "知识点",
+                ["doc_x"],
+                "knowledge",
+                "knowledge",
+                "",
+                "concept",
+                "same-nonce",
+            )
+
+        self.assertEqual(first["question"], second["question"])
+        self.assertEqual(1, calls["count"])
+
+    def test_expression_prompt_omits_role_and_lists_existing(self):
+        prompt = prompts.build_expression_generate_user(
+            "",
+            "知识点",
+            [{"doc_id": "doc_x", "title": "测试文档", "text": "内容"}],
+            "concept",
+            ["旧问题"],
+        )
+
+        self.assertNotIn("【练习方向】", prompt)
+        self.assertIn("【已生成题目】", prompt)
+        self.assertIn("旧问题", prompt)
 
     def test_slow_generation_returns_close_question_quickly(self):
         expression_dir = self.data_dir / "expression"

@@ -26,6 +26,7 @@ async def next_question(req: ExpressionQuestionRequest):
             req.source_type,
             req.source_ref,
             req.question_type,
+            req.nonce,
         )
     except expression_service.ExpressionError as exc:
         raise HTTPException(422, str(exc))

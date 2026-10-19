@@ -152,6 +152,7 @@ class ExpressionQuestionRequest(BaseModel):
         default="",
         pattern="^(concept|compare|project|scenario|contribution)?$",
     )
+    nonce: str = Field(default="", max_length=64)
 
 
 class ExpressionAnalyzeRequest(BaseModel):

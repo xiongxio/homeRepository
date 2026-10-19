@@ -263,6 +263,17 @@ class ReviewApiSmokeTests(unittest.TestCase):
             "source_title": "接口测试讲义",
         }
         with (
+            patch.object(
+                expression_service,
+                "GENERATED_QUESTION_CACHE_DIR",
+                Path(self._tmp.name) / "expression" / "generated_questions",
+            ),
+            patch.object(
+                expression_service,
+                "KNOWLEDGE_POOL_DIR",
+                Path(self._tmp.name) / "expression" / "knowledge_pools",
+            ),
+            patch.object(expression_service, "_prefetch_speaking_materials"),
             patch(
                 "backend.app.services.expression._search_chunks_for_topic",
                 return_value=[

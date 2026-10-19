@@ -274,6 +274,12 @@ export interface ExpressionQuestion {
   group_topic?: string
   related_review_ids?: string[]
   generation_pending?: boolean
+  pool_index?: number
+  pool_limit?: number
+  pool_remaining?: number
+  pool_exhausted?: boolean
+  pool_message?: string
+  pool_questions?: ExpressionQuestion[]
 }
 
 export interface ExpressionMetrics {

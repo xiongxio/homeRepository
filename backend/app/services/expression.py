@@ -14,6 +14,7 @@ import random
 import re
 import time
 import threading
+import unicodedata
 import uuid
 from collections import Counter
 from collections.abc import Callable
@@ -45,11 +46,16 @@ EXPRESSION_GENERATE_FAST_WAIT_SECONDS = 6.0
 EXPRESSION_MISTAKE_FAST_WAIT_SECONDS = 6.0
 EXPRESSION_MISTAKE_MAX_RECORDS = 12
 MISTAKE_REWRITE_VERSION = "spoken-v2"
+KNOWLEDGE_POOL_DIR = settings.data_dir / "expression" / "knowledge_pools"
+KNOWLEDGE_POOL_VERSION = 1
+KNOWLEDGE_POOL_LIMIT = 5
+KNOWLEDGE_POOL_TTL_SECONDS = 30 * 24 * 3600
 _SPEAKING_JOBS_LOCK = threading.Lock()
 _SPEAKING_JOBS: set[str] = set()
 _SPEAKING_WORK_LIMIT = threading.Semaphore(2)
 _GENERATION_JOBS_LOCK = threading.Lock()
 _PENDING_GENERATIONS: dict[str, Queue] = {}
+_KNOWLEDGE_POOL_LOCK = threading.Lock()
 
 # 纯粹的语气词，出现即扣分。
 FILLER_WORDS = ("嗯", "呃", "唉", "哦", "啊", "额")
@@ -81,6 +87,7 @@ def ensure_dirs() -> None:
     KEYWORD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     SPEAKING_MATERIAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     GENERATED_QUESTION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    KNOWLEDGE_POOL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -487,6 +494,7 @@ def _generated_question_cache_key(
     doc_ids: list[str] | None,
     question_type: str = "",
     source_type: str = "knowledge",
+    nonce: str = "",
 ) -> str:
     payload = {
         "role": role_key,
@@ -494,9 +502,146 @@ def _generated_question_cache_key(
         "doc_ids": sorted({str(d) for d in (doc_ids or []) if d}),
         "question_type": (question_type or "").strip().lower(),
         "source_type": (source_type or "knowledge").strip().lower(),
+        "nonce": (nonce or "").strip(),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _knowledge_pool_key(
+    doc_ids: list[str],
+    question_type: str,
+    topic_hint: str,
+) -> str:
+    payload = {
+        "doc_ids": sorted({str(doc).strip() for doc in doc_ids if str(doc).strip()}),
+        "question_type": (question_type or "").strip().lower(),
+        "topic": (topic_hint or "").strip().lower(),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _knowledge_pool_path(pool_key: str) -> Path:
+    return KNOWLEDGE_POOL_DIR / f"{pool_key}.json"
+
+
+def _empty_knowledge_pool() -> dict:
+    return {"version": KNOWLEDGE_POOL_VERSION, "questions": [], "updated_at": 0}
+
+
+def _load_knowledge_pool(pool_key: str) -> dict:
+    data = _read_json(_knowledge_pool_path(pool_key))
+    if not isinstance(data, dict) or data.get("version") != KNOWLEDGE_POOL_VERSION:
+        return _empty_knowledge_pool()
+    if int(data.get("updated_at") or 0) + KNOWLEDGE_POOL_TTL_SECONDS < int(time.time()):
+        return _empty_knowledge_pool()
+    if not isinstance(data.get("questions"), list):
+        data["questions"] = []
+    return data
+
+
+def _save_knowledge_pool(pool_key: str, pool: dict) -> None:
+    ensure_dirs()
+    path = _knowledge_pool_path(pool_key)
+    pool["version"] = KNOWLEDGE_POOL_VERSION
+    pool["updated_at"] = int(time.time())
+    tmp_path = path.with_name(path.name + ".tmp")
+    _write_json(tmp_path, pool)
+    os.replace(tmp_path, path)
+
+
+def _question_fingerprint(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return re.sub(
+        r"[\s，。；！？、,.!?;:：\"'“”‘’（）()【】\[\]《》<>_\-—]+",
+        "",
+        normalized,
+    )
+
+
+def _question_ngrams(text: str, size: int = 2) -> set[str]:
+    if len(text) < size:
+        return {text} if text else set()
+    return {text[index : index + size] for index in range(len(text) - size + 1)}
+
+
+def _is_duplicate_question(candidate: str, existing: list[str]) -> bool:
+    fingerprint = _question_fingerprint(candidate)
+    if not fingerprint:
+        return True
+    candidate_grams = _question_ngrams(fingerprint)
+    for text in existing:
+        other = _question_fingerprint(text)
+        if not other:
+            continue
+        if fingerprint == other:
+            return True
+        other_grams = _question_ngrams(other)
+        if not candidate_grams or not other_grams:
+            continue
+        similarity = len(candidate_grams & other_grams) / len(
+            candidate_grams | other_grams
+        )
+        if similarity >= 0.8:
+            return True
+    return False
+
+
+def _knowledge_question_core(
+    payload: dict,
+    source_tag: str,
+    source_ref: str,
+) -> dict:
+    question = str(payload.get("question") or "")
+    source_title = str(payload.get("source_title") or "")
+    return {
+        "question": question,
+        "label": f"AI-{hashlib.sha1(question.encode('utf-8')).hexdigest()[:8]}",
+        "source": source_title,
+        "section": "",
+        "topic_matched": False,
+        "generated_by_llm": True,
+        "disclaimer": (
+            "本题目由 AI 基于所选知识库文档生成，仅供表达练习，"
+            "可能与原文表述有差异。"
+        ),
+        "reference_answer": str(payload.get("reference_answer") or ""),
+        "keywords": payload.get("keywords") or [],
+        "standard_key_points": payload.get("standard_key_points") or [],
+        "reference_script": str(payload.get("reference_script") or ""),
+        "source_tag": source_tag or "knowledge",
+        "source_type": "knowledge",
+        "source_ref": source_ref,
+        "question_type": str(payload.get("question_type") or ""),
+        "source_title": source_title,
+    }
+
+
+def _knowledge_pool_response(
+    payload: dict,
+    pool: dict,
+    index: int,
+    source_tag: str,
+    source_ref: str,
+    *,
+    exhausted: bool = False,
+    message: str = "",
+) -> dict:
+    questions = [
+        _knowledge_question_core(item["payload"], source_tag, source_ref)
+        for item in pool.get("questions", [])
+        if isinstance(item, dict) and isinstance(item.get("payload"), dict)
+    ]
+    return {
+        **_knowledge_question_core(payload, source_tag, source_ref),
+        "pool_index": index,
+        "pool_limit": KNOWLEDGE_POOL_LIMIT,
+        "pool_remaining": max(0, KNOWLEDGE_POOL_LIMIT - len(questions)),
+        "pool_exhausted": exhausted,
+        "pool_message": message,
+        "pool_questions": questions,
+    }
 
 
 def _load_generated_question(cache_key: str) -> dict | None:
@@ -928,6 +1073,7 @@ def _generate_question_via_llm(
     topic_hint: str,
     chunks: list[dict],
     question_type: str = "",
+    existing_questions: list[str] | None = None,
 ) -> dict | None:
     """调用 LLM 根据原文片段生成一道表达练习题，失败返回 None。"""
     if not chunks:
@@ -940,6 +1086,7 @@ def _generate_question_via_llm(
                 topic_hint,
                 chunks,
                 question_type,
+                existing_questions,
             ),
             max_tokens=1200,
             timeout=EXPRESSION_GENERATE_TIMEOUT_SECONDS,
@@ -979,6 +1126,7 @@ def drill_question(
     source_type: str = "",
     source_ref: str = "",
     question_type: str = "",
+    nonce: str = "",
 ) -> dict:
     """按题源出一道表达练习题；真题库之外的来源不再被岗位真题截走。"""
     role = roles_service.get_role(role_key)
@@ -1001,36 +1149,201 @@ def drill_question(
             "role_name": role.name,
         }
 
-    if source_type in ("knowledge", "resume"):
-        if source_type == "knowledge":
-            chunks = (
-                _search_chunks_for_topic(topic_hint, source_doc_ids)
-                if topic_hint.strip()
-                else _first_chunks_for_documents(source_doc_ids)
+    if source_type == "knowledge":
+        chunks = (
+            _search_chunks_for_topic(topic_hint, source_doc_ids)
+            if topic_hint.strip()
+            else _first_chunks_for_documents(source_doc_ids)
+        )
+        if not chunks:
+            raise ExpressionError(
+                "所选知识库文档里没有可用的原文片段，请先确认已勾选包含面试内容的文档。"
             )
-            if not chunks:
-                raise ExpressionError(
-                    "所选知识库文档里没有可用的原文片段，请先确认已勾选包含面试内容的文档。"
+        doc_key = sorted(
+            {str(doc).strip() for doc in (source_doc_ids or []) if str(doc).strip()}
+        )
+        generated_source_ref = "|".join(doc_key)
+        pool_key = _knowledge_pool_key(doc_key, question_type, topic_hint)
+
+        with _KNOWLEDGE_POOL_LOCK:
+            pool = _load_knowledge_pool(pool_key)
+
+        def knowledge_response(
+            payload: dict,
+            index: int,
+            *,
+            exhausted: bool = False,
+            message: str = "",
+        ) -> dict:
+            return {
+                **_knowledge_pool_response(
+                    payload,
+                    pool,
+                    index,
+                    source,
+                    generated_source_ref,
+                    exhausted=exhausted,
+                    message=message,
+                ),
+                "role_key": role.key,
+                "role_name": role.name,
+            }
+
+        if nonce:
+            for index, item in enumerate(pool.get("questions", []), start=1):
+                if item.get("nonce") == nonce:
+                    return knowledge_response(item["payload"], index)
+        elif pool.get("questions"):
+            return knowledge_response(pool["questions"][0]["payload"], 1)
+
+        if len(pool.get("questions", [])) >= KNOWLEDGE_POOL_LIMIT:
+            return knowledge_response(
+                pool["questions"][-1]["payload"],
+                len(pool["questions"]),
+                exhausted=True,
+                message=(
+                    f"本组已生成 {KNOWLEDGE_POOL_LIMIT} 道题，"
+                    "可点「重练本组」复用，或换文档/题型开始新一组。"
+                ),
+            )
+
+        cache_key = _generated_question_cache_key(
+            "knowledge",
+            topic_hint,
+            doc_key,
+            question_type,
+            "knowledge",
+            nonce,
+        )
+        existing_questions = [
+            str(item["payload"].get("question") or "")
+            for item in pool.get("questions", [])
+            if isinstance(item, dict) and isinstance(item.get("payload"), dict)
+        ]
+
+        def knowledge_generator(role_name, topic, source_chunks, qtype):
+            return _generate_question_via_llm(
+                "",
+                topic,
+                source_chunks,
+                qtype,
+                existing_questions,
+            )
+
+        generated_payload = _load_generated_question(cache_key)
+        if not generated_payload:
+            generated_queue = _get_or_start_generation(
+                cache_key,
+                "",
+                topic_hint,
+                chunks,
+                question_type,
+                knowledge_generator,
+            )
+            generated_payload = _wait_for_generated_question(
+                generated_queue,
+                EXPRESSION_GENERATE_FAST_WAIT_SECONDS,
+            )
+            if generated_payload:
+                _save_generated_question(cache_key, generated_payload)
+        if not generated_payload:
+            raise ExpressionError(
+                "暂时无法从所选知识库文档生成表达题，请稍后重试。"
+            )
+
+        _prefetch_speaking_materials(
+            generated_payload["question"],
+            generated_payload["reference_answer"],
+            generated_payload.get("keywords") or [],
+        )
+        keywords, standard_key_points, reference_script = _speaking_materials(
+            generated_payload["question"],
+            generated_payload["reference_answer"],
+            generated_payload.get("keywords") or [],
+            allow_llm=False,
+        )
+        generated_payload = {
+            **generated_payload,
+            "keywords": keywords or generated_payload.get("keywords") or [],
+            "standard_key_points": (
+                standard_key_points
+                or generated_payload.get("standard_key_points")
+                or []
+            ),
+            "reference_script": (
+                reference_script
+                or generated_payload.get("reference_script")
+                or ""
+            ),
+            "question_type": (
+                question_type or generated_payload.get("question_type") or ""
+            ),
+        }
+
+        with _KNOWLEDGE_POOL_LOCK:
+            pool = _load_knowledge_pool(pool_key)
+            if nonce:
+                for index, item in enumerate(pool.get("questions", []), start=1):
+                    if item.get("nonce") == nonce:
+                        return knowledge_response(item["payload"], index)
+            if len(pool.get("questions", [])) >= KNOWLEDGE_POOL_LIMIT:
+                return knowledge_response(
+                    pool["questions"][-1]["payload"],
+                    len(pool["questions"]),
+                    exhausted=True,
+                    message=(
+                        f"本组已生成 {KNOWLEDGE_POOL_LIMIT} 道题，"
+                        "可点「重练本组」复用，或换文档/题型开始新一组。"
+                    ),
                 )
-            doc_key = sorted({str(doc).strip() for doc in (source_doc_ids or []) if str(doc).strip()})
-            cache_key = _generated_question_cache_key(
-                role.key,
-                topic_hint,
-                doc_key,
-                question_type,
-                source_type,
+            existing_questions = [
+                str(item["payload"].get("question") or "")
+                for item in pool.get("questions", [])
+                if isinstance(item, dict) and isinstance(item.get("payload"), dict)
+            ]
+            if _is_duplicate_question(
+                generated_payload["question"],
+                existing_questions,
+            ):
+                if pool.get("questions"):
+                    return knowledge_response(
+                        pool["questions"][-1]["payload"],
+                        len(pool["questions"]),
+                        exhausted=True,
+                        message=(
+                            "这份材料的主要知识点已经覆盖得差不多了，"
+                            "可点「重练本组」复用，或换文档/题型开启新一组。"
+                        ),
+                    )
+                raise ExpressionError(
+                    "生成的问题与已有题目重复，请换一批资料或题型。"
+                )
+            pool.setdefault("questions", []).append(
+                {
+                    "nonce": nonce,
+                    "payload": generated_payload,
+                    "fingerprint": _question_fingerprint(
+                        generated_payload["question"]
+                    ),
+                    "created_at": int(time.time()),
+                }
             )
-            generated_source_ref = "|".join(doc_key)
-        else:
-            chunks, resume_title, resume_id = _resume_source_chunks()
-            cache_key = _generated_question_cache_key(
-                role.key,
-                topic_hint,
-                [resume_id or "resume"],
-                question_type,
-                "resume",
-            )
-            generated_source_ref = resume_id
+            _save_knowledge_pool(pool_key, pool)
+            index = len(pool["questions"])
+
+        return knowledge_response(generated_payload, index)
+
+    if source_type == "resume":
+        chunks, resume_title, resume_id = _resume_source_chunks()
+        cache_key = _generated_question_cache_key(
+            role.key,
+            topic_hint,
+            [resume_id or "resume"],
+            question_type,
+            "resume",
+            nonce,
+        )
+        generated_source_ref = resume_id
 
         generated_payload = _load_generated_question(cache_key)
         if not generated_payload:
@@ -1049,7 +1362,7 @@ def drill_question(
                 _save_generated_question(cache_key, generated_payload)
         if not generated_payload:
             raise ExpressionError(
-                "暂时无法从所选来源生成表达题，请稍后重试或换一批资料/知识点。"
+                "暂时无法从当前简历生成表达题，请稍后重试。"
             )
 
         _prefetch_speaking_materials(
@@ -1063,9 +1376,10 @@ def drill_question(
             generated_payload.get("keywords") or [],
             allow_llm=False,
         )
-        source_title = str(generated_payload.get("source_title") or "")
-        if not source_title and source_type == "resume":
-            source_title = resume_title
+        source_title = (
+            str(generated_payload.get("source_title") or "").strip()
+            or resume_title
+        )
         return {
             "question": generated_payload["question"],
             "label": f"AI-{cache_key[:8]}",
@@ -1074,7 +1388,7 @@ def drill_question(
             "topic_matched": False,
             "generated_by_llm": True,
             "disclaimer": (
-                "本题目由 AI 基于所选来源自动生成，仅供表达练习，"
+                "本题目由 AI 基于当前简历自动生成，仅供表达练习，"
                 "可能与原文表述有差异。"
             ),
             "reference_answer": generated_payload["reference_answer"],
@@ -1082,9 +1396,12 @@ def drill_question(
             "standard_key_points": standard_key_points,
             "reference_script": reference_script,
             "source_tag": source,
-            "source_type": source_type,
+            "source_type": "resume",
             "source_ref": generated_source_ref,
-            "question_type": question_type or generated_payload.get("question_type") or "",
+            "question_type": (
+                question_type or generated_payload.get("question_type") or ""
+            ),
+            "source_title": source_title,
             "role_key": role.key,
             "role_name": role.name,
         }
@@ -1130,6 +1447,7 @@ def drill_question(
             source_doc_ids,
             question_type,
             "bank",
+            nonce,
         )
         cached = _load_generated_question(cache_key)
         if cached:

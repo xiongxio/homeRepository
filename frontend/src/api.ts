@@ -658,6 +658,7 @@ export async function getExpressionQuestion(
   sourceType = '',
   sourceRef = '',
   questionType = '',
+  nonce = '',
 ): Promise<ExpressionQuestion> {
   return apiFetch<ExpressionQuestion>('/expression/question', {
     method: 'POST',
@@ -670,6 +671,7 @@ export async function getExpressionQuestion(
       source_type: sourceType,
       source_ref: sourceRef,
       question_type: questionType,
+      nonce,
     }),
   })
 }
