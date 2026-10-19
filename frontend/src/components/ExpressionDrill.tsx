@@ -67,7 +67,6 @@ const EXPRESSION_SOURCES: Array<{
   { key: 'bank', label: '真题题库', hint: '从岗位真题库抽题' },
   { key: 'knowledge', label: '知识库文档', hint: '从指定文档生成表达题' },
   { key: 'mistake', label: '错题复盘', hint: '围绕同一道错题展开' },
-  { key: 'resume', label: '简历', hint: '从项目、技能和亮点出题' },
 ]
 
 const QUESTION_TYPE_OPTIONS: Array<{
@@ -1426,7 +1425,7 @@ export function ExpressionDrill({
               </div>
               <p className="mt-1.5 text-xs leading-5 text-zinc-500">
                 {QUESTION_TYPE_OPTIONS.find((option) => option.key === questionType)?.hint}
-                题型约束主要作用于知识库文档和简历生成题；真题库仍以现有抽题为准。
+                题型约束主要作用于知识库文档生成题；真题库仍以现有抽题为准。
               </p>
             </div>
           </div>
