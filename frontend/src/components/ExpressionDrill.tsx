@@ -425,6 +425,7 @@ export function ExpressionDrill({
     }
     streamRef.current = null
     recorderRef.current = null
+    startedAtRef.current = 0
     chunksRef.current = []
     setElapsed(0)
   }, [])
@@ -806,6 +807,8 @@ export function ExpressionDrill({
     if (!mediaSupported || busy === 'record' || busy === 'transcribing') return
     const round = answerRoundRef.current + 1
     answerRoundRef.current = round
+    // 必须在 await 之前标记本轮有效，否则 getUserMedia 返回后会被误判为已取消。
+    shouldTranscribeRef.current = true
     setError('')
     setSession(null)
     setTranscript('')
@@ -815,6 +818,7 @@ export function ExpressionDrill({
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       if (round !== answerRoundRef.current || !shouldTranscribeRef.current) {
         stream.getTracks().forEach((track) => track.stop())
+        if (round === answerRoundRef.current) setBusy('')
         return
       }
       const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find(
@@ -852,15 +856,22 @@ export function ExpressionDrill({
           chunksRef.current = []
           streamRef.current = null
           recorderRef.current = null
-          if (round === answerRoundRef.current) setBusy('')
+          startedAtRef.current = 0
+          if (round === answerRoundRef.current) {
+            shouldTranscribeRef.current = false
+            setBusy('')
+          }
         }
       }
 
       recorder.start(500)
-    startedAtRef.current = Date.now()
-    setElapsed(0)
+      startedAtRef.current = Date.now()
+      setElapsed(0)
       timerRef.current = window.setInterval(() => {
-        setElapsed(Math.floor((Date.now() - startedAtRef.current) / 1000))
+        if (!startedAtRef.current) return
+        setElapsed(
+          Math.max(0, Math.floor((Date.now() - startedAtRef.current) / 1000)),
+        )
       }, 500)
     } catch (recordError) {
       if (round !== answerRoundRef.current) return
@@ -882,9 +893,22 @@ export function ExpressionDrill({
 
   const stopAnswer = () => {
     clearTimer()
-    const seconds = Math.max(1, Math.round((Date.now() - startedAtRef.current) / 1000))
-    setElapsed(seconds)
-    recorderRef.current?.stop()
+    const recorder = recorderRef.current
+    const startedAt = startedAtRef.current
+    if (startedAt > 0) {
+      setElapsed(Math.max(1, Math.round((Date.now() - startedAt) / 1000)))
+    }
+    startedAtRef.current = 0
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.stop()
+      return
+    }
+    // 录音器没启动成功时，结束按钮也必须能复位，不能把界面卡在录音态。
+    shouldTranscribeRef.current = false
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    recorderRef.current = null
+    setBusy('')
   }
 
   useEffect(() => {
