@@ -49,6 +49,20 @@ const MISTAKE_TIME_RANGES: { value: MistakeTimeRange; label: string }[] = [
 // 单次组卷上限与后端保持一致（单份最多 30 道）。
 // 题量再大，LLM 一次性命题容易超时，也不利于一次练完，超量应拆成多套。
 const MAX_TOTAL_QUESTIONS = 30
+const QUIZ_DOC_IDS_STORAGE_KEY = 'opc-quiz-doc-ids'
+
+function readStoredDocIds(): string[] {
+  try {
+    const raw = window.localStorage.getItem(QUIZ_DOC_IDS_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+      : []
+  } catch {
+    return []
+  }
+}
 
 export function QuizSetup({
   documents,
@@ -59,7 +73,7 @@ export function QuizSetup({
   const [topics, setTopics] = useState<QuizTopic[]>([])
   const [selected, setSelected] = useState<string[]>([])
   const [filter, setFilter] = useState('')
-  const [docIds, setDocIds] = useState<string[]>([])
+  const [docIds, setDocIds] = useState<string[]>(readStoredDocIds)
   const [single, setSingle] = useState(10)
   const [multiple, setMultiple] = useState(6)
   const [judge, setJudge] = useState(4)
@@ -201,6 +215,27 @@ export function QuizSetup({
     if (!mistakePanelOpen) return
     void loadMistakes()
   }, [mistakePanelOpen])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        QUIZ_DOC_IDS_STORAGE_KEY,
+        JSON.stringify(docIds),
+      )
+    } catch {
+      // 隐私模式或存储被禁用时，不影响本次组卷。
+    }
+  }, [docIds])
+
+  useEffect(() => {
+    if (documents.length === 0) return
+    const available = new Set(documents.map((doc) => doc.doc_id))
+    setDocIds((current) =>
+      current.every((docId) => available.has(docId))
+        ? current
+        : current.filter((docId) => available.has(docId)),
+    )
+  }, [documents])
 
   const filteredMistakes = useMemo(() => {
     if (!mistakesLoaded) return []
