@@ -42,7 +42,7 @@ GENERATED_QUESTION_CACHE_DIR = settings.data_dir / "expression" / "generated_que
 GENERATED_QUESTION_CACHE_VERSION = "generated-questions-v1"
 GENERATED_QUESTION_TTL_SECONDS = 7 * 24 * 3600
 EXPRESSION_GENERATE_FAST_WAIT_SECONDS = 6.0
-EXPRESSION_MISTAKE_FAST_WAIT_SECONDS = 8.0
+EXPRESSION_MISTAKE_FAST_WAIT_SECONDS = 6.0
 EXPRESSION_MISTAKE_MAX_RECORDS = 12
 _SPEAKING_JOBS_LOCK = threading.Lock()
 _SPEAKING_JOBS: set[str] = set()
@@ -845,6 +845,7 @@ def _mistake_expression_question(record: dict, source: str, role) -> dict:
         "section": topic,
         "topic_matched": True,
         "generated_by_llm": generated_by_llm,
+        "generation_pending": not generated_by_llm,
         "disclaimer": disclaimer,
         "reference_answer": payload["reference_answer"],
         "keywords": keywords[:8],

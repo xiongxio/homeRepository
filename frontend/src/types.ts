@@ -272,6 +272,7 @@ export interface ExpressionQuestion {
   group_size?: number
   group_topic?: string
   related_review_ids?: string[]
+  generation_pending?: boolean
 }
 
 export interface ExpressionMetrics {

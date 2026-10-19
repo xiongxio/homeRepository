@@ -368,6 +368,7 @@ export function ExpressionDrill({
   const chunksRef = useRef<Blob[]>([])
   const shouldTranscribeRef = useRef(false)
   const answerRoundRef = useRef(0)
+  const mistakeRefreshTimeoutRef = useRef<number | null>(null)
   const isRetrying = previousSessionId !== ''
   const reviewGroups = useMemo(() => buildReviewGroups(reviewRecords), [reviewRecords])
   const filteredReviewGroups = useMemo(() => {
@@ -436,10 +437,54 @@ export function ExpressionDrill({
     }
   }, [])
 
+  const scheduleMistakeRefresh = useCallback(
+    (
+      key: string,
+      hint: string,
+      source: ExpressionSourceContext,
+      round: number,
+      attempt = 0,
+    ) => {
+      if (source.sourceType !== 'mistake' || attempt > 4) return
+      if (mistakeRefreshTimeoutRef.current) {
+        window.clearTimeout(mistakeRefreshTimeoutRef.current)
+      }
+      mistakeRefreshTimeoutRef.current = window.setTimeout(async () => {
+        mistakeRefreshTimeoutRef.current = null
+        if (answerRoundRef.current !== round) return
+        try {
+          const refreshed = await getExpressionQuestion(
+            key,
+            hint,
+            source.docIds,
+            source.sourceTag,
+            source.sourceType,
+            source.sourceRef,
+            source.questionType,
+          )
+          if (answerRoundRef.current !== round) return
+          if (refreshed.generation_pending) {
+            scheduleMistakeRefresh(key, hint, source, round, attempt + 1)
+            return
+          }
+          setQuestion(refreshed)
+        } catch {
+          // 后台生成失败时保留当前兜底题，不打断用户。
+        }
+      }, 15000)
+    },
+    [],
+  )
+
   const loadQuestion = useCallback(
     async (key: string, hint = '', source?: ExpressionSourceContext) => {
       const activeSource = source ?? activeSourceRef.current
       answerRoundRef.current += 1
+      const round = answerRoundRef.current
+      if (mistakeRefreshTimeoutRef.current) {
+        window.clearTimeout(mistakeRefreshTimeoutRef.current)
+        mistakeRefreshTimeoutRef.current = null
+      }
       cancelActiveRecording()
       setBusy('question')
       setError('')
@@ -450,24 +495,35 @@ export function ExpressionDrill({
       try {
         setTopicHint(hint)
         activeSourceRef.current = activeSource
-        setQuestion(
-          await getExpressionQuestion(
-            key,
-            hint,
-            activeSource.docIds,
-            activeSource.sourceTag,
-            activeSource.sourceType,
-            activeSource.sourceRef,
-            activeSource.questionType,
-          ),
+        const nextQuestion = await getExpressionQuestion(
+          key,
+          hint,
+          activeSource.docIds,
+          activeSource.sourceTag,
+          activeSource.sourceType,
+          activeSource.sourceRef,
+          activeSource.questionType,
         )
+        setQuestion(nextQuestion)
+        if (nextQuestion.generation_pending) {
+          scheduleMistakeRefresh(key, hint, activeSource, round)
+        }
       } catch (loadError) {
         setError(loadError instanceof Error ? loadError.message : '取题失败。')
       } finally {
         setBusy('')
       }
     },
-    [cancelActiveRecording],
+    [cancelActiveRecording, scheduleMistakeRefresh],
+  )
+
+  useEffect(
+    () => () => {
+      if (mistakeRefreshTimeoutRef.current) {
+        window.clearTimeout(mistakeRefreshTimeoutRef.current)
+      }
+    },
+    [],
   )
 
   useEffect(() => {
@@ -1245,6 +1301,11 @@ export function ExpressionDrill({
             {question?.disclaimer && (
               <p className="mt-1 text-xs leading-5 text-amber-700">
                 {question.disclaimer}
+              </p>
+            )}
+            {question?.generation_pending && (
+              <p className="mt-1 text-xs font-medium text-sky-700">
+                AI 改写正在后台生成，完成后会自动刷新。
               </p>
             )}
           </div>
