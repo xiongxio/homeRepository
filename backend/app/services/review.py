@@ -565,6 +565,24 @@ def list_records() -> list[dict]:
     return [_public_record(item) for item in _load_state()["records"]]
 
 
+def get_record(review_id: str) -> dict:
+    """按复盘标识读取单条记录，供表达训练绑定错题来源。"""
+    key = str(review_id or "").strip()
+    if not key:
+        raise ReviewError("缺少复盘记录标识。")
+    record = next(
+        (
+            item
+            for item in _load_state()["records"]
+            if str(item.get("review_id") or "") == key
+        ),
+        None,
+    )
+    if not record:
+        raise ReviewError("复盘记录不存在或已被移除。")
+    return _public_record(record)
+
+
 def get_dashboard() -> dict:
     migrate_legacy_mistakes()
     records = _load_state()["records"]

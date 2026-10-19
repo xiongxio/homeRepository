@@ -45,6 +45,7 @@ interface WrongReviewPageProps {
     module?: string,
     sourceDocIds?: string[],
     sourceTag?: string,
+    reviewId?: string,
   ) => void
 }
 
@@ -498,6 +499,7 @@ export function WrongReviewPage({
                                     undefined,
                                     recordDocIds(record),
                                     'wrong_review',
+                                    record.review_id,
                                   )
                                 }
                               >
@@ -616,6 +618,7 @@ export function WrongReviewPage({
                                 undefined,
                                 recordDocIds(record),
                                 'wrong_review',
+                                record.review_id,
                               )
                             }
                           >
@@ -983,6 +986,7 @@ export function WrongReviewPage({
                         undefined,
                         recordDocIds(record),
                         'wrong_review',
+                        record.review_id,
                       )
                     }
                   >

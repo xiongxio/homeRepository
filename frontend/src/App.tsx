@@ -119,6 +119,9 @@ export default function App() {
   const [job, setJob] = useState<JobState | null>(null)
   const [transcript, setTranscript] = useState('')
   const [jd, setJd] = useState(() => window.localStorage.getItem('opc-jd') ?? '')
+  const [company, setCompany] = useState(
+    () => window.localStorage.getItem('opc-company') ?? '',
+  )
   const [resume, setResume] = useState(
     () => window.localStorage.getItem('opc-resume') ?? '',
   )
@@ -143,6 +146,8 @@ export default function App() {
     token: number
     sourceDocIds?: string[]
     sourceTag?: string
+    sourceType?: string
+    sourceRef?: string
   } | null>(null)
   const requestIdRef = useRef(0)
   const analysisRequestRef = useRef<{ id: number; controller: AbortController } | null>(null)
@@ -155,6 +160,10 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem('opc-jd', jd)
   }, [jd])
+
+  useEffect(() => {
+    window.localStorage.setItem('opc-company', company)
+  }, [company])
 
   useEffect(() => {
     window.localStorage.setItem('opc-resume', resume)
@@ -260,6 +269,7 @@ export default function App() {
       module?: string,
       sourceDocIds?: string[],
       sourceTag = 'quiz_dashboard',
+      reviewId?: string,
     ) => {
       setExpressionSeed({
         topic,
@@ -267,6 +277,8 @@ export default function App() {
         token: Date.now(),
         sourceDocIds: sourceDocIds ?? [],
         sourceTag,
+        sourceType: reviewId ? 'mistake' : '',
+        sourceRef: reviewId ?? '',
       })
       setView('expression')
       window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -374,6 +386,7 @@ export default function App() {
         {
           transcript: source,
           jd,
+          company,
           resume,
           knowledge,
           resume_id: activeResume?.resume_id,
@@ -403,7 +416,7 @@ export default function App() {
     },
     // startAnalysis 依赖的状态在同一次渲染内已是最新值。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [jd, resume, documents, activeResume],
+    [jd, company, resume, documents, activeResume],
   )
 
   const restart = () => {
@@ -637,6 +650,10 @@ export default function App() {
               seedToken={expressionSeed?.token ?? 0}
               seedSourceDocIds={expressionSeed?.sourceDocIds ?? []}
               seedSourceTag={expressionSeed?.sourceTag ?? ''}
+              seedSourceType={expressionSeed?.sourceType ?? ''}
+              seedSourceRef={expressionSeed?.sourceRef ?? ''}
+              documents={documents}
+              activeResume={activeResume}
             />
           </div>
         )}
@@ -698,6 +715,7 @@ export default function App() {
                 {inputMode === 'live' ? (
                   <MockInterview
                     jd={jd}
+                    company={company}
                     resume={resume}
                     resumeId={activeResume?.resume_id}
                     resumeName={activeResume?.profile?.name}
@@ -783,6 +801,19 @@ export default function App() {
               />
 
               <ResumeAdvisor activeResume={activeResume} />
+
+              <section className="tool-card">
+                <label htmlFor="company" className="field-label">
+                  目标公司
+                </label>
+                <input
+                  id="company"
+                  className="text-input"
+                  value={company}
+                  onChange={(event) => setCompany(event.target.value)}
+                  placeholder="填写投递的公司名称，用于对齐岗位背景与高频问题。"
+                />
+              </section>
 
               <section className="tool-card">
                 <label htmlFor="jd" className="field-label">

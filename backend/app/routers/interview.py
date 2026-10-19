@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 
 from .. import prompts
 from .. import roles
-from ..schemas import InterviewTurnRequest
+from ..schemas import InterviewAnswerRequest, InterviewTurnRequest, TopQuestionsRequest
 from ..services import llm as llm_service
 from ..services import resume as resume_service
 from ..services import question_bank as question_bank_service
@@ -12,6 +12,7 @@ from ..services import question_bank as question_bank_service
 router = APIRouter(prefix="/api/interview", tags=["interview"])
 
 MAX_HISTORY_TURNS = 24
+MAX_TOP_QUESTIONS = 10
 
 
 @router.get("/roles")
@@ -49,6 +50,7 @@ async def interview_turn(req: InterviewTurnRequest):
         role_brief,
         bank_brief,
         resume_focus,
+        company=req.company,
     )
     history = [item for item in req.history[-MAX_HISTORY_TURNS:] if item.content.strip()]
     remaining = req.max_questions - req.asked_count
@@ -99,4 +101,141 @@ async def interview_turn(req: InterviewTurnRequest):
         "is_new_question": bool(data.get("is_new_question", True)),
         "is_final": bool(data.get("is_final", False)) or remaining <= 0,
         "note": str(data.get("note") or ""),
+    }
+
+
+@router.post("/top-questions")
+async def top_questions(req: TopQuestionsRequest):
+    """基于目标公司、JD、简历和知识库，生成面试可能性最高的 10 个核心问题。"""
+    resume_profile = resume_service.resolve_profile_text(req.resume_id)
+    role = roles.get_role(req.role_key)
+    role_brief = roles.build_role_brief(role) if role else ""
+    bank_brief = ""
+    resume_focus = ""
+    effective_jd = req.jd.strip()
+    if role:
+        if not effective_jd:
+            effective_jd = role.default_jd
+        try:
+            bank_brief = question_bank_service.build_question_bank_brief(
+                question_bank_service.load_role_questions(role.key)
+            )
+        except Exception:
+            bank_brief = ""
+        try:
+            resume_focus = roles.build_resume_focus(
+                role, resume_service.resolve_profile_dict(req.resume_id)
+            )
+        except Exception:
+            resume_focus = ""
+    context = prompts.build_interviewer_context(
+        effective_jd,
+        req.resume,
+        req.knowledge,
+        resume_profile,
+        role_brief,
+        bank_brief,
+        resume_focus,
+        company=req.company,
+    )
+    messages: list[dict] = [
+        {"role": "system", "content": prompts.TOP_QUESTIONS_SYSTEM},
+        {"role": "user", "content": context},
+    ]
+    try:
+        data = await asyncio.to_thread(
+            llm_service.chat_json_messages,
+            messages,
+            temperature=0.5,
+            max_tokens=6000,
+        )
+    except llm_service.LlmError as exc:
+        raise HTTPException(502, str(exc))
+    # 模型偶尔会多给、重复或漏字段；这里做一次归一化，保证页面拿到的是可直接渲染的题目。
+    questions: list[dict] = []
+    seen: set[str] = set()
+    for item in data.get("questions") or []:
+        if not isinstance(item, dict):
+            continue
+        question_text = str(item.get("question") or "").strip()
+        if not question_text or question_text in seen:
+            continue
+        seen.add(question_text)
+        questions.append(
+            {
+                "question": question_text,
+                "focus": str(item.get("focus") or "").strip(),
+                "reference_answer": str(item.get("reference_answer") or "").strip(),
+            }
+        )
+        if len(questions) == MAX_TOP_QUESTIONS:
+            break
+    if not questions:
+        raise HTTPException(502, "核心问题生成失败，未返回有效题目，请重试。")
+    return {"questions": questions}
+
+
+@router.post("/answer")
+async def interview_answer(req: InterviewAnswerRequest):
+    """候选人在模拟面试中卡壳时，为当前问题提供 40-60 秒参考答案。"""
+    resume_profile = resume_service.resolve_profile_text(req.resume_id)
+    role = roles.get_role(req.role_key)
+    role_brief = roles.build_role_brief(role) if role else ""
+    bank_brief = ""
+    resume_focus = ""
+    effective_jd = req.jd.strip()
+    if role:
+        if not effective_jd:
+            effective_jd = role.default_jd
+        try:
+            bank_brief = question_bank_service.build_question_bank_brief(
+                question_bank_service.load_role_questions(role.key)
+            )
+        except Exception:
+            bank_brief = ""
+        try:
+            resume_focus = roles.build_resume_focus(
+                role, resume_service.resolve_profile_dict(req.resume_id)
+            )
+        except Exception:
+            resume_focus = ""
+    context = prompts.build_interviewer_context(
+        effective_jd,
+        req.resume,
+        req.knowledge,
+        resume_profile,
+        role_brief,
+        bank_brief,
+        resume_focus,
+        company=req.company,
+    )
+    user_parts = [
+        context,
+        "【当前面试问题】\n" + req.question.strip(),
+        "【候选人目前已说内容】\n" + (req.candidate_answer.strip() or "（尚未回答）"),
+        "请生成这段参考答案。",
+    ]
+    messages: list[dict] = [
+        {"role": "system", "content": prompts.INTERVIEW_ANSWER_SYSTEM},
+        {"role": "user", "content": "\n\n".join(user_parts)},
+    ]
+    try:
+        data = await asyncio.to_thread(
+            llm_service.chat_json_messages,
+            messages,
+            temperature=0.5,
+            max_tokens=4000,
+        )
+    except llm_service.LlmError as exc:
+        raise HTTPException(502, str(exc))
+    answer = str(data.get("answer") or "").strip()
+    if not answer:
+        raise HTTPException(502, "参考答案生成失败，请重试。")
+    return {
+        "answer": answer,
+        "key_points": [
+            str(item).strip()
+            for item in (data.get("key_points") or [])
+            if str(item).strip()
+        ],
     }

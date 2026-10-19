@@ -94,6 +94,7 @@ export interface AnalysisReport {
 export interface AnalyzeRequest {
   transcript: string
   jd: string
+  company?: string
   resume: string
   knowledge?: string
   resume_id?: string
@@ -131,6 +132,7 @@ export interface InterviewMessage {
 
 export interface InterviewTurnRequest {
   jd: string
+  company?: string
   resume: string
   knowledge?: string
   history: InterviewMessage[]
@@ -154,6 +156,17 @@ export interface InterviewTurnResponse {
   is_new_question: boolean
   is_final: boolean
   note: string
+}
+
+export interface InterviewTopQuestion {
+  question: string
+  focus: string
+  reference_answer: string
+}
+
+export interface InterviewAnswerResponse {
+  answer: string
+  key_points: string[]
 }
 
 export interface ResumeProject {
@@ -228,6 +241,15 @@ export interface ResumeAdvice {
 
 export type ExpressionPracticeMode = 'read' | 'keywords' | 'blind'
 
+export type ExpressionSourceType = 'bank' | 'knowledge' | 'mistake' | 'resume'
+
+export type ExpressionQuestionType =
+  | 'concept'
+  | 'compare'
+  | 'project'
+  | 'scenario'
+  | 'contribution'
+
 export interface ExpressionQuestion {
   question: string
   label: string
@@ -243,6 +265,10 @@ export interface ExpressionQuestion {
   standard_key_points?: string[]
   reference_script?: string
   source_tag?: string
+  source_type?: string
+  source_ref?: string
+  question_type?: string
+  source_title?: string
 }
 
 export interface ExpressionMetrics {

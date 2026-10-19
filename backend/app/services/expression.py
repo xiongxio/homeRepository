@@ -431,15 +431,65 @@ def _search_chunks_for_topic(topic: str, doc_ids: list[str] | None) -> list[dict
     return results[:3]
 
 
+def _first_chunks_for_documents(doc_ids: list[str] | None, limit: int = 6) -> list[dict]:
+    """没有知识点提示时，从用户指定文档取少量原文作为出题上下文。"""
+    allowed = {str(doc_id).strip() for doc_id in (doc_ids or []) if str(doc_id).strip()}
+    if not allowed:
+        return []
+
+    chunks: list[dict] = []
+    for summary in knowledge_service.list_documents():
+        doc_id = str(summary.get("doc_id") or "").strip()
+        if doc_id not in allowed:
+            continue
+        document = knowledge_service.load_document(doc_id)
+        if not document:
+            continue
+        title = str(summary.get("title") or document.get("title") or "").strip()
+        for chunk in document.get("chunks") or []:
+            text = str(chunk.get("text") or "").strip()
+            if not text:
+                continue
+            chunks.append({
+                "doc_id": doc_id,
+                "title": title,
+                "text": text,
+            })
+            if len(chunks) >= limit:
+                return chunks
+    return chunks
+
+
+def _resume_source_chunks() -> tuple[list[dict], str, str]:
+    """把当前激活简历压成与知识库片段相同的出题输入。"""
+    from . import resume as resume_service
+
+    record = resume_service.get_active_resume()
+    if not record:
+        raise ExpressionError("还没有可用简历，请先在简历管理中上传或粘贴简历。")
+    title = str(record.get("title") or "当前简历").strip()
+    resume_id = str(record.get("resume_id") or "").strip()
+    profile_text = prompts.format_resume_profile(record.get("profile") or {})
+    raw_text = str(record.get("raw_text") or "").strip()
+    text = profile_text or raw_text
+    if not text:
+        raise ExpressionError("当前简历没有可用于出题的项目、技能或亮点内容。")
+    return [{"doc_id": resume_id or "resume", "title": title, "text": text[:6000]}], title, resume_id
+
+
 def _generated_question_cache_key(
     role_key: str,
     topic_hint: str,
     doc_ids: list[str] | None,
+    question_type: str = "",
+    source_type: str = "knowledge",
 ) -> str:
     payload = {
         "role": role_key,
         "topic": (topic_hint or "").strip().lower(),
         "doc_ids": sorted({str(d) for d in (doc_ids or []) if d}),
+        "question_type": (question_type or "").strip().lower(),
+        "source_type": (source_type or "knowledge").strip().lower(),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -492,6 +542,7 @@ def _get_or_start_generation(
     role_name: str,
     topic_hint: str,
     chunks: list[dict],
+    question_type: str = "",
 ) -> Queue:
     with _GENERATION_JOBS_LOCK:
         pending = _PENDING_GENERATIONS.get(cache_key)
@@ -501,7 +552,7 @@ def _get_or_start_generation(
         _PENDING_GENERATIONS[cache_key] = queue
 
     def worker() -> None:
-        result = _generate_question_via_llm(role_name, topic_hint, chunks)
+        result = _generate_question_via_llm(role_name, topic_hint, chunks, question_type)
         if result:
             _save_generated_question(cache_key, result)
         try:
@@ -519,10 +570,116 @@ def _get_or_start_generation(
     return queue
 
 
+def _mistake_reference_answer(record: dict) -> str:
+    answer_keys = {
+        str(item).strip().upper()
+        for item in (record.get("correct_answer") or [])
+        if str(item).strip()
+    }
+    option_answers: list[str] = []
+    for option in record.get("options") or []:
+        if not isinstance(option, dict):
+            continue
+        key = str(option.get("key") or "").strip()
+        text = str(option.get("text") or "").strip()
+        if key.upper() in answer_keys and text:
+            option_answers.append(f"{key}. {text}")
+
+    answer_text = "、".join(option_answers)
+    if not answer_text:
+        answer_text = str(record.get("correct_answer_text") or "").strip()
+    if not answer_text and answer_keys:
+        answer_text = "、".join(sorted(answer_keys))
+
+    parts: list[str] = []
+    if answer_text:
+        parts.append(f"正确答案：{answer_text}")
+    explanation = str(record.get("explanation") or "").strip()
+    if explanation:
+        parts.append(f"解析：{explanation}")
+    return "\n".join(parts)
+
+
+def _mistake_keywords(record: dict, reference_answer: str) -> list[str]:
+    candidates = [str(record.get("topic") or "").strip()]
+    for option in record.get("options") or []:
+        if isinstance(option, dict):
+            candidates.append(str(option.get("text") or "").strip())
+    candidates.extend(
+        part.strip()
+        for part in re.split(r"[，。；！？!?；;\n]+", reference_answer)
+        if part.strip()
+    )
+
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        keyword = _clean_speaking_keyword(value)
+        normalized = _keyword_norm(keyword)
+        if not keyword or len(keyword) > 24 or normalized in seen:
+            continue
+        seen.add(normalized)
+        keywords.append(keyword)
+        if len(keywords) >= 8:
+            break
+    return keywords
+
+
+def _mistake_expression_question(record: dict, source: str) -> dict:
+    stem = re.sub(r"\s+", " ", str(record.get("stem") or "")).strip()
+    if not stem:
+        raise ExpressionError("这道错题缺少题干，暂时无法用于表达训练。")
+    if len(stem) > 360:
+        stem = stem[:360].rstrip() + "…"
+
+    reference_answer = _mistake_reference_answer(record)
+    if not reference_answer:
+        raise ExpressionError("这道错题还没有正确答案或解析，暂时无法生成参考表达。")
+
+    topic = str(record.get("topic") or "未分类").strip() or "未分类"
+    review_id = str(record.get("review_id") or "").strip()
+    lineage = record.get("source_lineage") if isinstance(record.get("source_lineage"), dict) else {}
+    paper_titles = [
+        str(item).strip()
+        for item in (lineage.get("paper_doc_titles") or [])
+        if str(item).strip()
+    ]
+    source_title = str(record.get("source_title") or "").strip()
+    if not source_title and paper_titles:
+        source_title = paper_titles[0]
+
+    question = (
+        f"请把下面这道错题当成面试追问来讲清楚：{stem}\n"
+        "回答时先给结论，再解释正确答案为什么成立，最后说明这题最容易错在哪里。"
+    )
+    return {
+        "question": question,
+        "label": f"错题-{review_id[-8:] or '复盘'}",
+        "source": source_title,
+        "section": topic,
+        "topic_matched": True,
+        "generated_by_llm": False,
+        "disclaimer": (
+            "本题来自错题复盘，参考答案只引用该错题已有的正确答案与解析；"
+            "表达训练不重新判定技术答案对错。"
+        ),
+        "reference_answer": reference_answer,
+        "keywords": _mistake_keywords(record, reference_answer),
+        "standard_key_points": _fallback_key_points(reference_answer),
+        "reference_script": _fallback_reference_script(reference_answer),
+        "source_tag": source or "wrong_review",
+        "source_type": "mistake",
+        "source_ref": review_id,
+        "question_type": str(record.get("type") or ""),
+        "source_title": source_title,
+    }
+
+
 def _generate_question_via_llm(
     role_name: str,
     topic_hint: str,
     chunks: list[dict],
+    question_type: str = "",
 ) -> dict | None:
     """调用 LLM 根据原文片段生成一道表达练习题，失败返回 None。"""
     if not chunks:
@@ -530,7 +687,12 @@ def _generate_question_via_llm(
     try:
         raw = llm_service.chat_json(
             prompts.EXPRESSION_GENERATE_SYSTEM,
-            prompts.build_expression_generate_user(role_name, topic_hint, chunks),
+            prompts.build_expression_generate_user(
+                role_name,
+                topic_hint,
+                chunks,
+                question_type,
+            ),
             max_tokens=1200,
             timeout=EXPRESSION_GENERATE_TIMEOUT_SECONDS,
         )
@@ -557,6 +719,7 @@ def _generate_question_via_llm(
         "standard_key_points": key_points[:5],
         "reference_script": reference_script,
         "source_title": source_title,
+        "question_type": question_type,
     }
 
 
@@ -565,12 +728,119 @@ def drill_question(
     topic_hint: str = "",
     source_doc_ids: list[str] | None = None,
     source: str = "",
+    source_type: str = "",
+    source_ref: str = "",
+    question_type: str = "",
 ) -> dict:
-    """从该岗位的真题库里出一道表达练习题，避开最近练过的题。"""
+    """按题源出一道表达练习题；真题库之外的来源不再被岗位真题截走。"""
     role = roles_service.get_role(role_key)
     if not role:
         role_names = "、".join(profile.name for profile in roles_service.ROLE_PROFILES.values())
         raise ExpressionError(f"未知岗位，请选择{role_names}。")
+    if source_type == "mistake":
+        if not source_ref.strip():
+            raise ExpressionError("缺少错题标识，无法从错题复盘取题。")
+        from . import review as review_service
+
+        try:
+            record = review_service.get_record(source_ref)
+        except review_service.ReviewError as exc:
+            raise ExpressionError(str(exc)) from exc
+        payload = _mistake_expression_question(record, source)
+        return {
+            **payload,
+            "role_key": role.key,
+            "role_name": role.name,
+        }
+
+    if source_type in ("knowledge", "resume"):
+        if source_type == "knowledge":
+            chunks = (
+                _search_chunks_for_topic(topic_hint, source_doc_ids)
+                if topic_hint.strip()
+                else _first_chunks_for_documents(source_doc_ids)
+            )
+            if not chunks:
+                raise ExpressionError(
+                    "所选知识库文档里没有可用的原文片段，请先确认已勾选包含面试内容的文档。"
+                )
+            doc_key = sorted({str(doc).strip() for doc in (source_doc_ids or []) if str(doc).strip()})
+            cache_key = _generated_question_cache_key(
+                role.key,
+                topic_hint,
+                doc_key,
+                question_type,
+                source_type,
+            )
+            generated_source_ref = "|".join(doc_key)
+        else:
+            chunks, resume_title, resume_id = _resume_source_chunks()
+            cache_key = _generated_question_cache_key(
+                role.key,
+                topic_hint,
+                [resume_id or "resume"],
+                question_type,
+                "resume",
+            )
+            generated_source_ref = resume_id
+
+        generated_payload = _load_generated_question(cache_key)
+        if not generated_payload:
+            generated_queue = _get_or_start_generation(
+                cache_key,
+                role.name,
+                topic_hint,
+                chunks,
+                question_type,
+            )
+            generated_payload = _wait_for_generated_question(
+                generated_queue,
+                EXPRESSION_GENERATE_FAST_WAIT_SECONDS,
+            )
+            if generated_payload:
+                _save_generated_question(cache_key, generated_payload)
+        if not generated_payload:
+            raise ExpressionError(
+                "暂时无法从所选来源生成表达题，请稍后重试或换一批资料/知识点。"
+            )
+
+        _prefetch_speaking_materials(
+            generated_payload["question"],
+            generated_payload["reference_answer"],
+            generated_payload.get("keywords") or [],
+        )
+        keywords, standard_key_points, reference_script = _speaking_materials(
+            generated_payload["question"],
+            generated_payload["reference_answer"],
+            generated_payload.get("keywords") or [],
+            allow_llm=False,
+        )
+        source_title = str(generated_payload.get("source_title") or "")
+        if not source_title and source_type == "resume":
+            source_title = resume_title
+        return {
+            "question": generated_payload["question"],
+            "label": f"AI-{cache_key[:8]}",
+            "source": source_title,
+            "section": "",
+            "topic_matched": False,
+            "generated_by_llm": True,
+            "disclaimer": (
+                "本题目由 AI 基于所选来源自动生成，仅供表达练习，"
+                "可能与原文表述有差异。"
+            ),
+            "reference_answer": generated_payload["reference_answer"],
+            "keywords": keywords or generated_payload.get("keywords") or [],
+            "standard_key_points": standard_key_points,
+            "reference_script": reference_script,
+            "source_tag": source,
+            "source_type": source_type,
+            "source_ref": generated_source_ref,
+            "question_type": question_type or generated_payload.get("question_type") or "",
+            "role_key": role.key,
+            "role_name": role.name,
+        }
+
     questions = question_bank.load_role_questions(role.key, limit=60)
     if not questions:
         raise ExpressionError("真题库为空，请先在知识库导入面试题库文档。")
@@ -606,7 +876,13 @@ def drill_question(
         and topic_hint
         and source_doc_ids
     ):
-        cache_key = _generated_question_cache_key(role.key, topic_hint, source_doc_ids)
+        cache_key = _generated_question_cache_key(
+            role.key,
+            topic_hint,
+            source_doc_ids,
+            question_type,
+            "bank",
+        )
         cached = _load_generated_question(cache_key)
         if cached:
             generated_payload = cached
@@ -618,6 +894,7 @@ def drill_question(
                     role.name,
                     topic_hint,
                     chunks,
+                    question_type,
                 )
                 generated_payload = _wait_for_generated_question(
                     generated_queue,
@@ -656,6 +933,9 @@ def drill_question(
             "standard_key_points": standard_key_points,
             "reference_script": reference_script,
             "source_tag": source,
+            "source_type": source_type or "bank",
+            "source_ref": "",
+            "question_type": question_type,
             "role_key": role.key,
             "role_name": role.name,
         }
@@ -690,6 +970,9 @@ def drill_question(
         "standard_key_points": standard_key_points,
         "reference_script": reference_script,
         "source_tag": source,
+        "source_type": source_type or "bank",
+        "source_ref": "",
+        "question_type": question_type,
         "role_key": role.key,
         "role_name": role.name,
     }

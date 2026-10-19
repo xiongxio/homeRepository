@@ -4,10 +4,12 @@ import {
   BrainCircuit,
   CheckCheck,
   IdCard,
+  Lightbulb,
   Loader2,
   Mic,
   MicOff,
   MonitorSmartphone,
+  ListChecks,
   Send,
   Square,
   UserRound,
@@ -19,16 +21,24 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   listInterviewRoles,
   listTTSVoices,
+  requestInterviewAnswer,
   requestInterviewTurn,
+  requestTopQuestions,
   searchKnowledge,
   synthesiseSpeech,
 } from '../api'
 import type { TTSVoice } from '../api'
 import { useSpeech } from '../hooks/useSpeech'
-import type { InterviewMessage, InterviewRoleOption } from '../types'
+import type {
+  InterviewAnswerResponse,
+  InterviewMessage,
+  InterviewRoleOption,
+  InterviewTopQuestion,
+} from '../types'
 
 interface MockInterviewProps {
   jd: string
+  company: string
   resume: string
   resumeId?: string
   resumeName?: string
@@ -58,6 +68,7 @@ function buildTranscript(messages: InterviewMessage[]): string {
 
 export function MockInterview({
   jd,
+  company,
   resume,
   resumeId,
   resumeName,
@@ -81,6 +92,11 @@ export function MockInterview({
   const [isDone, setIsDone] = useState(false)
   const [typedAnswer, setTypedAnswer] = useState('')
   const [error, setError] = useState('')
+  const [topQuestions, setTopQuestions] = useState<InterviewTopQuestion[] | null>(null)
+  const [topLoading, setTopLoading] = useState(false)
+  const [expandedTop, setExpandedTop] = useState<number | null>(null)
+  const [answerData, setAnswerData] = useState<InterviewAnswerResponse | null>(null)
+  const [answerLoading, setAnswerLoading] = useState(false)
   const knowledgeRef = useRef('')
   const scrollRef = useRef<HTMLDivElement | null>(null)
   // 试听音频不走 useSpeech，需要单独持有引用才能在切换岗位时停掉。
@@ -171,6 +187,9 @@ export function MockInterview({
       stopListening()
       setIsThinking(false)
       setRoleKey(nextKey)
+      setTopQuestions(null)
+      setExpandedTop(null)
+      setAnswerData(null)
       // 借这次点击（浏览器认可的用户手势）把输出设备唤醒并保持，
       // 这样正式播报时不用再等声卡冷启动。
       void warmUpOutput()
@@ -197,6 +216,7 @@ export function MockInterview({
       try {
         const turn = await requestInterviewTurn({
           jd: effectiveJd,
+          company,
           resume,
           knowledge: knowledgeRef.current,
           history,
@@ -235,6 +255,7 @@ export function MockInterview({
     },
     [
       effectiveJd,
+      company,
       resume,
       resumeId,
       maxQuestions,
@@ -299,6 +320,7 @@ export function MockInterview({
     setAskedCount(0)
     setIsDone(false)
     setError('')
+    setAnswerData(null)
     if (hasKnowledge) {
       try {
         // 检索词以岗位关键词为主，简历为辅，避免跨岗位串题。
@@ -326,7 +348,86 @@ export function MockInterview({
     ]
     setMessages(history)
     setTypedAnswer('')
+    setAnswerData(null)
     await runTurn(history, askedCount)
+  }
+
+  const handleAskForAnswer = async () => {
+    if (answerLoading || isThinking) return
+    const question = [...messages]
+      .reverse()
+      .find((message) => message.role === 'interviewer')?.content
+    if (!question) return
+    const candidate = [...messages]
+      .reverse()
+      .find((message) => message.role === 'candidate')?.content
+    stopListening()
+    setAnswerData(null)
+    setAnswerLoading(true)
+    setError('')
+    try {
+      const data = await requestInterviewAnswer({
+        company,
+        jd: effectiveJd,
+        resume,
+        knowledge: knowledgeRef.current,
+        resume_id: resumeId,
+        role_key: roleKey,
+        question,
+        candidate_answer: candidate ?? '',
+      })
+      setAnswerData(data)
+    } catch (answerError) {
+      setError(
+        answerError instanceof Error
+          ? answerError.message
+          : '参考答案生成失败，请重试。',
+      )
+    } finally {
+      setAnswerLoading(false)
+    }
+  }
+
+  const handleGenerateTopQuestions = async () => {
+    if (topLoading) return
+    setTopLoading(true)
+    setError('')
+    let knowledge = knowledgeRef.current
+    if (hasKnowledge && !knowledge) {
+      try {
+        const query =
+          `${activeRole?.search_query ?? ''}\n${resume.slice(0, 400)}`.trim() ||
+          `${effectiveJd}\n${resume}`.trim() ||
+          '测试岗位'
+        const chunks = await searchKnowledge(query, 4)
+        knowledge = chunks
+          .map((chunk) => `[${chunk.title}] ${chunk.text}`)
+          .join('\n\n')
+        knowledgeRef.current = knowledge
+      } catch {
+        knowledge = ''
+      }
+    }
+    try {
+      const data = await requestTopQuestions({
+        company,
+        jd: effectiveJd,
+        resume,
+        knowledge,
+        resume_id: resumeId,
+        role_key: roleKey,
+      })
+      setTopQuestions(data.questions)
+      setExpandedTop(null)
+    } catch (topError) {
+      setError(
+        topError instanceof Error
+          ? topError.message
+          : '核心问题生成失败，请重试。',
+      )
+    } finally {
+      setTopLoading(false)
+    }
   }
 
   const handleVoiceSubmit = async () => {
@@ -522,6 +623,74 @@ export function MockInterview({
           </p>
         )}
 
+        <div className="mt-4">
+          <button
+            type="button"
+            className="secondary-btn w-full py-2.5"
+            onClick={handleGenerateTopQuestions}
+            disabled={topLoading}
+          >
+            {topLoading ? (
+              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+            ) : (
+              <ListChecks className="size-4" aria-hidden="true" />
+            )}
+            {topLoading ? '正在生成 10 个核心问题' : '生成最可能的 10 个核心问题'}
+          </button>
+        </div>
+
+        {topQuestions && topQuestions.length > 0 && (
+          <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-sm font-semibold text-zinc-800">
+                核心问题 TOP{Math.min(topQuestions.length, 10)}
+              </p>
+              <p className="text-xs text-zinc-500">
+                参考答案按 40-60 秒口播设计
+              </p>
+            </div>
+            <ol className="mt-3 space-y-2">
+              {topQuestions.map((item, index) => {
+                const expanded = expandedTop === index
+                return (
+                  <li key={`${index}-${item.question.slice(0, 16)}`}>
+                    <button
+                      type="button"
+                      className="flex w-full items-start justify-between gap-2 rounded-lg bg-white px-3 py-2 text-left text-sm text-zinc-800 shadow-sm"
+                      onClick={() => setExpandedTop(expanded ? null : index)}
+                      aria-expanded={expanded}
+                    >
+                      <span className="min-w-0">
+                        <span className="font-semibold text-emerald-700">
+                          {index + 1}.
+                        </span>{' '}
+                        {item.question}
+                      </span>
+                      <span className="mt-0.5 shrink-0 text-xs text-zinc-400">
+                        {expanded ? '收起' : '展开'}
+                      </span>
+                    </button>
+                    {expanded && (
+                      <div className="mt-1.5 space-y-1.5 rounded-lg bg-white px-3 py-2 text-sm shadow-sm">
+                        {item.focus && (
+                          <p className="text-xs leading-5 text-zinc-500">
+                            考察点：{item.focus}
+                          </p>
+                        )}
+                        {item.reference_answer && (
+                          <p className="leading-6 text-zinc-700">
+                            {item.reference_answer}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
+            </ol>
+          </div>
+        )}
+
         <button type="button" className="primary-btn mt-5 w-full py-3" onClick={handleStart}>
           <Mic className="size-5" aria-hidden="true" />
           开始模拟面试
@@ -628,6 +797,54 @@ export function MockInterview({
 
       {!isDone && (
         <div className="mt-4 space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="secondary-btn"
+              onClick={handleAskForAnswer}
+              disabled={answerLoading || isThinking || !messages.some((m) => m.role === 'interviewer')}
+            >
+              {answerLoading ? (
+                <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <Lightbulb className="size-4" aria-hidden="true" />
+              )}
+              {answerLoading ? '正在生成参考答案' : '不会答，给我答案'}
+            </button>
+          </div>
+
+          {answerData && (
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4">
+              <p className="flex items-center gap-1.5 text-sm font-semibold text-emerald-800">
+                <Lightbulb className="size-4" aria-hidden="true" />
+                40-60 秒参考答案
+              </p>
+              <p className="mt-2 text-sm leading-6 text-zinc-800">
+                {answerData.answer}
+              </p>
+              {answerData.key_points.length > 0 && (
+                <ul className="mt-2 space-y-1 text-xs leading-5 text-emerald-900">
+                  {answerData.key_points.map((point, index) => (
+                    <li key={`${index}-${point.slice(0, 12)}`}>
+                      关键点 {index + 1}: {point}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <button
+                type="button"
+                className="mt-3 text-xs font-semibold text-emerald-700 underline underline-offset-2"
+                onClick={() => {
+                  if (!answerData || answerLoading || isThinking) return
+                  void submitAnswer(answerData.answer)
+                }}
+                disabled={answerLoading || isThinking}
+              >
+                照着这个回答提交
+              </button>
+            </div>
+          )}
+
           {voiceMode && recognitionSupported ? (
             <div className="flex flex-wrap items-center gap-3">
               {isListening ? (

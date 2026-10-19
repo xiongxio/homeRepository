@@ -33,7 +33,12 @@ async def analyze(req: AnalyzeRequest, request: Request):
         raise HTTPException(400, "转写文本不能为空")
     resume_profile = resume_service.resolve_profile_text(req.resume_id)
     user = prompts.build_analysis_user(
-        req.jd, req.resume, req.transcript, req.knowledge, resume_profile
+        req.jd,
+        req.resume,
+        req.transcript,
+        req.knowledge,
+        resume_profile,
+        company=req.company,
     )
     try:
         analysis_task = asyncio.create_task(

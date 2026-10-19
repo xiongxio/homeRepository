@@ -11,6 +11,8 @@ import type {
   InterviewRoleOption,
   InterviewTurnRequest,
   InterviewTurnResponse,
+  InterviewAnswerResponse,
+  InterviewTopQuestion,
   MistakeItem,
   QuizAttempt,
   QuizDocumentProgress,
@@ -419,6 +421,42 @@ export async function requestInterviewTurn(
   })
 }
 
+export async function requestInterviewAnswer(
+  request: {
+    company?: string
+    jd: string
+    resume: string
+    knowledge?: string
+    resume_id?: string
+    role_key?: string
+    question: string
+    candidate_answer?: string
+  },
+): Promise<InterviewAnswerResponse> {
+  return apiFetch<InterviewAnswerResponse>('/interview/answer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  })
+}
+
+export async function requestTopQuestions(
+  request: {
+    company?: string
+    jd: string
+    resume: string
+    knowledge?: string
+    resume_id?: string
+    role_key?: string
+  },
+): Promise<{ questions: InterviewTopQuestion[] }> {
+  return apiFetch<{ questions: InterviewTopQuestion[] }>('/interview/top-questions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  })
+}
+
 export async function listInterviewRoles(): Promise<InterviewRoleOption[]> {
   return apiFetch<InterviewRoleOption[]>('/interview/roles')
 }
@@ -603,6 +641,9 @@ export async function getExpressionQuestion(
   topicHint = '',
   sourceDocIds: string[] = [],
   sourceTag = '',
+  sourceType = '',
+  sourceRef = '',
+  questionType = '',
 ): Promise<ExpressionQuestion> {
   return apiFetch<ExpressionQuestion>('/expression/question', {
     method: 'POST',
@@ -612,6 +653,9 @@ export async function getExpressionQuestion(
       topic: topicHint,
       source_doc_ids: sourceDocIds,
       source: sourceTag,
+      source_type: sourceType,
+      source_ref: sourceRef,
+      question_type: questionType,
     }),
   })
 }

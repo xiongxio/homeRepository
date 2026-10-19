@@ -19,14 +19,20 @@ import {
   getExpressionProgress,
   getExpressionQuestion,
   listInterviewRoles,
+  listReviewRecords,
   transcribeExpressionClip,
 } from '../api'
 import type {
+  ExpressionQuestionType,
   ExpressionProgress,
   ExpressionQuestion,
   ExpressionPracticeMode,
+  ExpressionSourceType,
   ExpressionSession,
   InterviewRoleOption,
+  KnowledgeDocument,
+  ResumeRecord,
+  ReviewRecord,
 } from '../types'
 
 const SCORE_LABEL: Record<string, string> = {
@@ -51,6 +57,30 @@ const MODE_LABEL: Record<ExpressionPracticeMode, string> = {
   keywords: '关键词串联',
   blind: '无提示实战',
 }
+
+const EXPRESSION_SOURCES: Array<{
+  key: ExpressionSourceType
+  label: string
+  hint: string
+}> = [
+  { key: 'bank', label: '真题题库', hint: '从岗位真题库抽题' },
+  { key: 'knowledge', label: '知识库文档', hint: '从指定文档生成表达题' },
+  { key: 'mistake', label: '错题复盘', hint: '围绕同一道错题展开' },
+  { key: 'resume', label: '简历', hint: '从项目、技能和亮点出题' },
+]
+
+const QUESTION_TYPE_OPTIONS: Array<{
+  key: ExpressionQuestionType | ''
+  label: string
+  hint: string
+}> = [
+  { key: '', label: '不限', hint: '按原文最合适的角度出题' },
+  { key: 'concept', label: '概念解释', hint: '讲清定义、原理和边界' },
+  { key: 'compare', label: '对比辨析', hint: '讲清差异和选择依据' },
+  { key: 'project', label: '项目深挖', hint: '追问职责、取舍和难点' },
+  { key: 'scenario', label: '场景推演', hint: '结合事实判断如何处理' },
+  { key: 'contribution', label: '结果贡献', hint: '聚焦成果、影响和验证' },
+]
 
 function formatClock(seconds: number): string {
   const minutes = Math.floor(seconds / 60)
@@ -169,6 +199,34 @@ interface ExpressionDrillProps {
   seedToken?: number
   seedSourceDocIds?: string[]
   seedSourceTag?: string
+  seedSourceType?: string
+  seedSourceRef?: string
+  documents?: KnowledgeDocument[]
+  activeResume?: ResumeRecord | null
+}
+
+interface ExpressionSourceContext {
+  docIds: string[]
+  sourceTag: string
+  sourceType: string
+  sourceRef: string
+  questionType: string
+}
+
+function emptySourceContext(): ExpressionSourceContext {
+  return {
+    docIds: [],
+    sourceTag: '',
+    sourceType: 'bank',
+    sourceRef: '',
+    questionType: '',
+  }
+}
+
+function normalizeSourceType(value: string): ExpressionSourceType {
+  return value === 'knowledge' || value === 'mistake' || value === 'resume'
+    ? value
+    : 'bank'
 }
 
 export function ExpressionDrill({
@@ -177,6 +235,10 @@ export function ExpressionDrill({
   seedToken = 0,
   seedSourceDocIds = [],
   seedSourceTag = '',
+  seedSourceType = '',
+  seedSourceRef = '',
+  documents = [],
+  activeResume = null,
 }: ExpressionDrillProps) {
   const [roles, setRoles] = useState<InterviewRoleOption[]>([])
   const [roleKey, setRoleKey] = useState(
@@ -196,10 +258,23 @@ export function ExpressionDrill({
   const [progress, setProgress] = useState<ExpressionProgress | null>(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+  const [sourceType, setSourceType] = useState<ExpressionSourceType>(() =>
+    normalizeSourceType(seedSourceType),
+  )
+  const [questionType, setQuestionType] = useState<ExpressionQuestionType | ''>('')
+  const [selectedDocIds, setSelectedDocIds] = useState<string[]>(seedSourceDocIds)
+  const [selectedReviewId, setSelectedReviewId] = useState(seedSourceRef)
+  const [reviewRecords, setReviewRecords] = useState<ReviewRecord[]>([])
+  const [resumeRecord, setResumeRecord] = useState<ResumeRecord | null>(activeResume)
   const timerRef = useRef<number | null>(null)
   const seededTokenRef = useRef(seedToken)
-  const seededDocIdsRef = useRef<string[]>(seedSourceDocIds)
-  const seededSourceTagRef = useRef(seedSourceTag)
+  const activeSourceRef = useRef<ExpressionSourceContext>({
+    docIds: seedSourceDocIds,
+    sourceTag: seedSourceTag,
+    sourceType: normalizeSourceType(seedSourceType),
+    sourceRef: seedSourceRef,
+    questionType: '',
+  })
   const startedAtRef = useRef(0)
   const streamRef = useRef<MediaStream | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
@@ -244,7 +319,8 @@ export function ExpressionDrill({
   }, [])
 
   const loadQuestion = useCallback(
-    async (key: string, hint = '', docIds: string[] = [], sourceTag = '') => {
+    async (key: string, hint = '', source?: ExpressionSourceContext) => {
+      const activeSource = source ?? activeSourceRef.current
       answerRoundRef.current += 1
       cancelActiveRecording()
       setBusy('question')
@@ -255,7 +331,18 @@ export function ExpressionDrill({
       setRetryMissedPoints([])
       try {
         setTopicHint(hint)
-        setQuestion(await getExpressionQuestion(key, hint, docIds, sourceTag))
+        activeSourceRef.current = activeSource
+        setQuestion(
+          await getExpressionQuestion(
+            key,
+            hint,
+            activeSource.docIds,
+            activeSource.sourceTag,
+            activeSource.sourceType,
+            activeSource.sourceRef,
+            activeSource.questionType,
+          ),
+        )
       } catch (loadError) {
         setError(loadError instanceof Error ? loadError.message : '取题失败。')
       } finally {
@@ -266,6 +353,16 @@ export function ExpressionDrill({
   )
 
   useEffect(() => {
+    listReviewRecords()
+      .then(setReviewRecords)
+      .catch(() => setReviewRecords([]))
+  }, [])
+
+  useEffect(() => {
+    setResumeRecord(activeResume)
+  }, [activeResume])
+
+  useEffect(() => {
     listInterviewRoles().then((items) => {
       setRoles(items)
       const initial = items.some((item) => item.key === roleKey)
@@ -274,7 +371,7 @@ export function ExpressionDrill({
       if (initial !== roleKey) {
         setRoleKey(initial)
       }
-      void loadQuestion(initial, seedTopic, seedSourceDocIds, seedSourceTag)
+      void loadQuestion(initial, seedTopic)
     })
     void refreshProgress()
     // 只在首次挂载时加载岗位和题目；切换岗位由 chooseRole 显式触发，避免重复取题。
@@ -282,22 +379,179 @@ export function ExpressionDrill({
   }, [])
 
   useEffect(() => {
-    if (seedToken > 0 && seedToken !== seededTokenRef.current && seedTopic) {
-      seededTokenRef.current = seedToken
-      seededDocIdsRef.current = seedSourceDocIds
-      seededSourceTagRef.current = seedSourceTag
-      void loadQuestion(roleKey, seedTopic, seedSourceDocIds, seedSourceTag)
+    const normalizedSeedSource = normalizeSourceType(seedSourceType)
+    const hasSeedContext =
+      seedToken > 0 &&
+      seedToken !== seededTokenRef.current &&
+      (Boolean(seedTopic) || normalizedSeedSource !== 'bank')
+    if (!hasSeedContext) return
+
+    seededTokenRef.current = seedToken
+    const source = {
+      docIds: seedSourceDocIds,
+      sourceTag: normalizedSeedSource === 'bank' ? seedSourceTag : '',
+      sourceType: normalizedSeedSource,
+      sourceRef: seedSourceRef,
+      questionType: '',
     }
+    setSourceType(normalizedSeedSource)
+    setQuestionType('')
+    if (normalizedSeedSource === 'knowledge') setSelectedDocIds(seedSourceDocIds)
+    if (normalizedSeedSource === 'mistake') setSelectedReviewId(seedSourceRef)
+    activeSourceRef.current = source
+
+    if (normalizedSeedSource === 'knowledge' && seedSourceDocIds.length === 0) {
+      setQuestion(null)
+      setError('请先勾选至少一份知识库文档，再开始训练。')
+      return
+    }
+    if (normalizedSeedSource === 'mistake' && !seedSourceRef) {
+      setQuestion(null)
+      setError('请选择一道错题。')
+      return
+    }
+    void loadQuestion(roleKey, seedTopic, source)
     // seedTopic/roleKey 只是为本次新种子服务，避免旧话题在切换岗位后反复触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seedToken])
+
+  const buildSourceContext = (next?: Partial<ExpressionSourceContext>) => {
+    const source: ExpressionSourceContext = {
+      docIds: selectedDocIds,
+      sourceTag: '',
+      sourceType,
+      sourceRef:
+        sourceType === 'mistake'
+          ? selectedReviewId
+          : sourceType === 'resume'
+            ? resumeRecord?.resume_id ?? ''
+            : sourceType === 'knowledge'
+              ? selectedDocIds.join('|')
+              : '',
+      questionType,
+    }
+    return { ...source, ...next }
+  }
+
+  const reloadWithSource = (source: ExpressionSourceContext) => {
+    activeSourceRef.current = source
+    void loadQuestion(roleKey, topicHint, source)
+  }
+
+  const changeSourceType = (next: ExpressionSourceType) => {
+    if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
+    setSourceType(next)
+    const nextReviewId =
+      next === 'mistake'
+        ? selectedReviewId || reviewRecords[0]?.review_id || ''
+        : selectedReviewId
+    if (next === 'mistake') {
+      setSelectedReviewId(nextReviewId)
+    }
+    const source: ExpressionSourceContext = {
+      docIds: selectedDocIds,
+      sourceTag: '',
+      sourceType: next,
+      sourceRef:
+        next === 'mistake'
+          ? nextReviewId
+          : next === 'resume'
+            ? resumeRecord?.resume_id ?? ''
+            : next === 'knowledge'
+              ? selectedDocIds.join('|')
+              : '',
+      questionType,
+    }
+    if (next === 'knowledge' && selectedDocIds.length === 0) {
+      activeSourceRef.current = source
+      setQuestion(null)
+      setError('请先勾选至少一份知识库文档，再开始训练。')
+      return
+    }
+    if (next === 'mistake' && !nextReviewId) {
+      activeSourceRef.current = source
+      setQuestion(null)
+      setError('还没有可用的错题复盘记录。')
+      return
+    }
+    if (next === 'resume' && !resumeRecord) {
+      activeSourceRef.current = source
+      setQuestion(null)
+      setError('暂无简历，请先在「简历管理」上传或粘贴简历后再使用该题源。')
+      return
+    }
+    reloadWithSource(source)
+  }
+
+  const changeQuestionType = (next: ExpressionQuestionType | '') => {
+    if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
+    const source = buildSourceContext({ questionType: next })
+    setQuestionType(next)
+    if (source.sourceType === 'knowledge' && source.docIds.length === 0) {
+      activeSourceRef.current = source
+      setQuestion(null)
+      setError('请先勾选至少一份知识库文档，再选择题型。')
+      return
+    }
+    if (source.sourceType === 'mistake' && !source.sourceRef) {
+      activeSourceRef.current = source
+      setQuestion(null)
+      setError('请先选择一道错题，再选择题型。')
+      return
+    }
+    if (source.sourceType === 'resume' && !resumeRecord) {
+      activeSourceRef.current = source
+      setQuestion(null)
+      setError('暂无简历，请先在「简历管理」上传或粘贴简历后再选择题型。')
+      return
+    }
+    reloadWithSource(source)
+  }
+
+  const toggleDocument = (docId: string) => {
+    const next = selectedDocIds.includes(docId)
+      ? selectedDocIds.filter((item) => item !== docId)
+      : [...selectedDocIds, docId]
+    setSelectedDocIds(next)
+    const source = buildSourceContext({
+      docIds: next,
+      sourceRef: next.join('|'),
+    })
+    if (sourceType !== 'knowledge') return
+    if (next.length === 0) {
+      activeSourceRef.current = source
+      setQuestion(null)
+      setError('请至少选择一份知识库文档。')
+      return
+    }
+    reloadWithSource(source)
+  }
+
+  const changeReviewRecord = (reviewId: string) => {
+    setSelectedReviewId(reviewId)
+    if (sourceType !== 'mistake') return
+    const source = buildSourceContext({ sourceRef: reviewId })
+    activeSourceRef.current = source
+    if (!reviewId) {
+      setQuestion(null)
+      setError('请选择一道错题。')
+      return
+    }
+    reloadWithSource(source)
+  }
 
   const chooseRole = (key: string) => {
     if (key === roleKey && (busy === 'record' || busy === 'transcribing')) return
     setRoleKey(key)
     window.localStorage.setItem('opc-expression-role', key)
     setSession(null)
-    void loadQuestion(key)
+    setSourceType('bank')
+    setQuestionType('')
+    setSelectedDocIds([])
+    setSelectedReviewId('')
+    const source = emptySourceContext()
+    activeSourceRef.current = source
+    void loadQuestion(key, '', source)
   }
 
   const chooseHintMode = (mode: ExpressionPracticeMode) => {
@@ -326,7 +580,7 @@ export function ExpressionDrill({
   const nextQuestionFromStart = () => {
     setHintMode('read')
     window.localStorage.setItem('opc-expression-hint-mode', 'read')
-    void loadQuestion(roleKey)
+    void loadQuestion(roleKey, topicHint)
   }
 
   const followProgression = () => {
@@ -561,6 +815,127 @@ export function ExpressionDrill({
           </div>
         )}
 
+        <div className="mt-4 space-y-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div>
+              <span className="field-label">练习来源</span>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {EXPRESSION_SOURCES.map((source) => {
+                  const active = sourceType === source.key
+                  return (
+                    <button
+                      key={source.key}
+                      type="button"
+                      className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
+                        active
+                          ? 'border-emerald-500 bg-emerald-50 text-emerald-800'
+                          : 'border-zinc-200 bg-white text-zinc-600 hover:border-zinc-300'
+                      }`}
+                      onClick={() => changeSourceType(source.key)}
+                      disabled={Boolean(busy)}
+                    >
+                      {source.label}
+                    </button>
+                  )
+                })}
+              </div>
+              <p className="mt-1.5 text-xs leading-5 text-zinc-500">
+                {EXPRESSION_SOURCES.find((source) => source.key === sourceType)?.hint}
+              </p>
+            </div>
+            <div>
+              <span className="field-label">练习题型</span>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {QUESTION_TYPE_OPTIONS.map((option) => {
+                  const active = questionType === option.key
+                  return (
+                    <button
+                      key={option.key || 'any'}
+                      type="button"
+                      className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
+                        active
+                          ? 'border-sky-500 bg-sky-50 text-sky-800'
+                          : 'border-zinc-200 bg-white text-zinc-600 hover:border-zinc-300'
+                      }`}
+                      onClick={() => changeQuestionType(option.key)}
+                      disabled={Boolean(busy)}
+                    >
+                      {option.label}
+                    </button>
+                  )
+                })}
+              </div>
+              <p className="mt-1.5 text-xs leading-5 text-zinc-500">
+                {QUESTION_TYPE_OPTIONS.find((option) => option.key === questionType)?.hint}
+                题型约束主要作用于知识库文档和简历生成题；真题库仍以现有抽题为准。
+              </p>
+            </div>
+          </div>
+
+          {sourceType === 'knowledge' && (
+            <div>
+              <p className="text-xs font-medium text-zinc-600">指定知识库文档（可多选）</p>
+              {documents.length === 0 ? (
+                <p className="mt-1.5 text-xs leading-5 text-zinc-500">
+                  知识库还没有文档，请先在「在线刷题」页右侧导入面试错题本或面试纪要。
+                </p>
+              ) : (
+                <div className="mt-2 max-h-44 space-y-1 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2">
+                  {documents.map((doc) => (
+                    <label
+                      key={doc.doc_id}
+                      className="flex items-start gap-2 rounded-md px-2 py-1.5 text-sm leading-5 text-zinc-700 hover:bg-zinc-50"
+                    >
+                      <input
+                        type="checkbox"
+                        className="mt-1 size-4 accent-emerald-600"
+                        checked={selectedDocIds.includes(doc.doc_id)}
+                        onChange={() => toggleDocument(doc.doc_id)}
+                      />
+                      <span className="min-w-0 truncate">{doc.title}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {sourceType === 'mistake' && (
+            <div>
+              <label className="field-label" htmlFor="expression-review-source">
+                选择错题
+              </label>
+              <select
+                id="expression-review-source"
+                className="text-input disabled:cursor-not-allowed disabled:bg-zinc-50 disabled:text-zinc-400"
+                value={selectedReviewId}
+                onChange={(event) => changeReviewRecord(event.target.value)}
+                disabled={reviewRecords.length === 0 || Boolean(busy)}
+              >
+                <option value="">未选择</option>
+                {reviewRecords.map((record) => (
+                  <option key={record.review_id} value={record.review_id}>
+                    {record.topic} · {record.stem.slice(0, 40)}
+                  </option>
+                ))}
+              </select>
+              {reviewRecords.length === 0 && (
+                <p className="mt-1.5 text-xs leading-5 text-zinc-500">
+                  还没有错题复盘记录，先在「在线刷题」完成答卷并同步错题。
+                </p>
+              )}
+            </div>
+          )}
+
+          {sourceType === 'resume' && (
+            <div className="rounded-lg bg-zinc-50 px-3 py-2.5 text-xs leading-5 text-zinc-600">
+              {resumeRecord
+                ? `使用当前简历《${resumeRecord.title}》出题，聚焦项目、技能与亮点。`
+                : '暂无简历，请先在「简历管理」上传或粘贴简历后再使用该题源。'}
+            </div>
+          )}
+        </div>
+
         <div className="mt-4">
           <label className="field-label" htmlFor="expression-role">
             练习方向
@@ -593,18 +968,22 @@ export function ExpressionDrill({
           <div className="min-w-0">
             <p className="text-xs font-medium text-zinc-500">
               {question
-                ? `真题编号 ${question.label || '未编号'}`
+                ? question.source_type === 'mistake'
+                  ? `错题表达训练 ${question.label || ''}`
+                  : `真题编号 ${question.label || '未编号'}`
                 : '选好岗位后取一道真题开始'}
             </p>
             <p className="mt-1.5 text-[15px] font-medium leading-7 text-zinc-900">
-              {question?.question ?? '点击右侧按钮，从你的真实面试题库里抽一道表达练习题。'}
+              {question?.question ??
+                '点击右侧按钮，从你的真实面试题库里抽一道表达练习题。'}
             </p>
             {question?.source && (
               <p className="mt-1 text-xs leading-5 text-zinc-500">
                 来源文档：{question.source}
               </p>
             )}
-            {question?.source_tag === 'wrong_review' && (
+            {(question?.source_type === 'mistake' ||
+              question?.source_tag === 'wrong_review') && (
               <p className="mt-1 text-xs font-medium text-emerald-700">来自错题复盘</p>
             )}
             {question?.source_tag === 'result_page' && (
@@ -627,7 +1006,7 @@ export function ExpressionDrill({
           <button
             type="button"
             className="secondary-btn shrink-0"
-            onClick={() => void loadQuestion(roleKey)}
+            onClick={() => void loadQuestion(roleKey, topicHint)}
             disabled={Boolean(busy)}
           >
             {busy === 'question' ? (
@@ -648,8 +1027,12 @@ export function ExpressionDrill({
             }`}
           >
             {busy === 'question'
-              ? `正在根据薄弱知识点「${topicHint}」选题。`
-              : question?.topic_matched === false
+              ? question?.source_type === 'mistake'
+                ? `正在载入错题「${topicHint}」。`
+                : `正在根据薄弱知识点「${topicHint}」选题。`
+              : question?.source_type === 'mistake'
+                ? `已绑定错题：${topicHint}。换题会继续围绕这组知识点的同一道错题展开。`
+                : question?.topic_matched === false
                 ? `真题库里暂时没有匹配「${topicHint}」的题，已选择最接近的一道真题。练习方向仍按薄弱知识点定位；导入相关真题库后会优先命中。`
                 : `已定位薄弱知识点：${topicHint}。本题来自相关真题。`}
           </p>
@@ -823,7 +1206,11 @@ export function ExpressionDrill({
                 </span>
               )}
             </div>
-            <button type="button" className="secondary-btn" onClick={() => void loadQuestion(roleKey)}>
+            <button
+              type="button"
+              className="secondary-btn"
+              onClick={() => void loadQuestion(roleKey, topicHint)}
+            >
               <RefreshCw className="size-4" aria-hidden="true" />
               练下一题
             </button>

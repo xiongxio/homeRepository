@@ -148,6 +148,175 @@ class ReviewApiSmokeTests(unittest.TestCase):
         self.assertEqual(0, retry.json()["retried"])
         self.assertEqual(0, retry.json()["pending_count"])
 
+    def test_expression_question_api_accepts_wrong_review_source(self):
+        question = {
+            "topic": "接口自动化",
+            "type": "single",
+            "stem": "API 自动化断言应该校验什么？",
+            "options": [
+                {"key": "A", "text": "只校验 HTTP 200"},
+                {"key": "B", "text": "状态码、关键业务字段和契约"},
+            ],
+            "correct_answer": ["B"],
+            "correct_answer_text": "B",
+            "user_answer": ["A"],
+            "user_answer_text": "A",
+            "is_correct": False,
+            "explanation": "接口断言要覆盖业务结果，而不是只看状态码。",
+            "source_title": "接口测试讲义",
+            "source_doc_id": "doc_api",
+            "source_docs": [{"doc_id": "doc_api", "title": "接口测试讲义"}],
+        }
+        paper = {
+            "paper_id": "paper_expression_source",
+            "title": "接口测试卷",
+            "questions": [question],
+        }
+        review_service.sync_wrong_answers([question], paper)
+        review_id = review_service.list_records()[0]["review_id"]
+
+        with patch(
+            "backend.app.services.question_bank.load_role_questions",
+            return_value=[],
+        ):
+            response = self.client.post(
+                "/api/expression/question",
+                json={
+                    "role_key": "ai_app_dev",
+                    "topic": "接口自动化",
+                    "source": "wrong_review",
+                    "source_type": "mistake",
+                    "source_ref": review_id,
+                },
+            )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("mistake", body["source_type"])
+        self.assertEqual(review_id, body["source_ref"])
+        self.assertIn(question["stem"], body["question"])
+        self.assertIn("接口断言要覆盖业务结果", body["reference_answer"])
+
+        missing = self.client.post(
+            "/api/expression/question",
+            json={
+                "role_key": "ai_app_dev",
+                "source": "wrong_review",
+                "source_type": "mistake",
+                "source_ref": "rv_missing",
+            },
+        )
+        self.assertEqual(422, missing.status_code)
+        self.assertIn("复盘记录不存在", missing.json()["detail"])
+
+    def test_expression_question_api_generates_from_selected_knowledge_docs(self):
+        fake_payload = {
+            "question": "接口自动化断言到底该校验什么？",
+            "reference_answer": "要校验状态码、关键业务字段和契约，不能只看 HTTP 200。",
+            "keywords": ["状态码", "业务字段", "契约"],
+            "standard_key_points": ["覆盖业务结果", "不只状态码"],
+            "reference_script": "先给结论：接口断言要覆盖状态码、关键业务字段和契约；只看 HTTP 200 会漏掉真实业务错误。",
+            "source_title": "接口测试讲义",
+        }
+        with (
+            patch(
+                "backend.app.services.expression._search_chunks_for_topic",
+                return_value=[
+                    {
+                        "doc_id": "doc_api",
+                        "title": "接口测试讲义",
+                        "text": "API 自动化断言应该校验状态码、关键业务字段和契约。",
+                    }
+                ],
+            ),
+            patch(
+                "backend.app.services.expression._generate_question_via_llm",
+                return_value=fake_payload,
+            ),
+            patch(
+                "backend.app.services.question_bank.load_role_questions",
+                side_effect=AssertionError("知识库题源不应读取岗位真题库"),
+            ) as load_bank,
+        ):
+            response = self.client.post(
+                "/api/expression/question",
+                json={
+                    "role_key": "ai_app_dev",
+                    "topic": "接口自动化",
+                    "source_doc_ids": ["doc_api"],
+                    "source": "knowledge",
+                    "source_type": "knowledge",
+                    "question_type": "concept",
+                },
+            )
+
+        load_bank.assert_not_called()
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("knowledge", body["source_type"])
+        self.assertIn("doc_api", body["source_ref"])
+        self.assertEqual("concept", body["question_type"])
+        self.assertTrue(body["generated_by_llm"])
+        self.assertIn("接口自动化断言", body["question"])
+
+    def test_expression_question_api_generates_from_active_resume(self):
+        fake_payload = {
+            "question": "你在接口自动化项目里最值得讲的成果是什么？",
+            "reference_answer": "我主导接口自动化，把核心接口覆盖到 200 个，回归耗时从 800ms 降到 220ms。",
+            "keywords": ["接口自动化", "200 个", "回归耗时"],
+            "standard_key_points": ["真实项目成果", "量化指标"],
+            "reference_script": "先给结论：我在接口自动化项目里最值得讲的是覆盖规模和回归耗时；覆盖 200 个接口，回归从 800ms 降到 220ms。",
+            "source_title": "测试简历",
+        }
+        resume_record = {
+            "resume_id": "resume_001",
+            "title": "测试简历",
+            "raw_text": "接口自动化项目：覆盖 200 个接口，回归从 800ms 降到 220ms。",
+            "profile": {
+                "name": "张三",
+                "headline": "接口测试工程师",
+                "projects": [
+                    {
+                        "name": "接口自动化平台",
+                        "summary": "覆盖核心接口 200 个",
+                        "metrics": ["回归耗时 800ms 降到 220ms"],
+                    }
+                ],
+            },
+        }
+        with (
+            patch(
+                "backend.app.services.resume.get_active_resume",
+                return_value=resume_record,
+            ),
+            patch(
+                "backend.app.services.expression._generate_question_via_llm",
+                return_value=fake_payload,
+            ),
+            patch(
+                "backend.app.services.question_bank.load_role_questions",
+                side_effect=AssertionError("简历题源不应读取岗位真题库"),
+            ) as load_bank,
+        ):
+            response = self.client.post(
+                "/api/expression/question",
+                json={
+                    "role_key": "ai_app_dev",
+                    "source": "resume",
+                    "source_type": "resume",
+                    "question_type": "contribution",
+                },
+            )
+
+        load_bank.assert_not_called()
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("resume", body["source_type"])
+        self.assertEqual("resume_001", body["source_ref"])
+        self.assertEqual("contribution", body["question_type"])
+        self.assertTrue(body["generated_by_llm"])
+        self.assertIn("接口自动化项目", body["question"])
+
 
     def test_today_new_dashboard_and_include_today_practice_api(self):
         question = {

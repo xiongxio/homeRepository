@@ -30,6 +30,7 @@ class JobCreateResponse(BaseModel):
 class AnalyzeRequest(BaseModel):
     transcript: str = Field(min_length=1)
     jd: str = ""
+    company: str = ""
     resume: str = ""
     knowledge: str = ""
     resume_id: str = ""
@@ -64,11 +65,32 @@ class InterviewMessage(BaseModel):
 
 class InterviewTurnRequest(BaseModel):
     jd: str = ""
+    company: str = ""
     resume: str = ""
     knowledge: str = ""
     history: list[InterviewMessage] = Field(default_factory=list)
     asked_count: int = Field(default=0, ge=0)
     max_questions: int = Field(default=6, ge=1, le=20)
+    resume_id: str = ""
+    role_key: str = ""
+
+
+class InterviewAnswerRequest(BaseModel):
+    company: str = ""
+    jd: str = ""
+    resume: str = ""
+    knowledge: str = ""
+    resume_id: str = ""
+    role_key: str = ""
+    question: str = Field(min_length=1, max_length=2000)
+    candidate_answer: str = Field(default="", max_length=20000)
+
+
+class TopQuestionsRequest(BaseModel):
+    company: str = ""
+    jd: str = ""
+    resume: str = ""
+    knowledge: str = ""
     resume_id: str = ""
     role_key: str = ""
 
@@ -121,6 +143,12 @@ class ExpressionQuestionRequest(BaseModel):
     topic: str = Field(default="", max_length=200)
     source_doc_ids: list[str] = Field(default_factory=list)
     source: str = Field(default="", max_length=20)
+    source_type: str = Field(default="", pattern="^(bank|knowledge|mistake|resume)?$")
+    source_ref: str = Field(default="", max_length=200)
+    question_type: str = Field(
+        default="",
+        pattern="^(concept|compare|project|scenario|contribution)?$",
+    )
 
 
 class ExpressionAnalyzeRequest(BaseModel):

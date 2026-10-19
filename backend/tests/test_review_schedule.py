@@ -332,6 +332,47 @@ class ReviewScheduleTests(unittest.TestCase):
             expression_service.SPEAKING_MATERIAL_CACHE_DIR = originals["material_dir"]
             expression_service.GENERATED_QUESTION_CACHE_DIR = originals["generated_dir"]
 
+    def test_expression_question_can_use_wrong_review_record_as_source(self):
+        question = self._question()
+        review_service.sync_wrong_answers([question], self._paper([question]))
+        review_id = review_service.list_records()[0]["review_id"]
+
+        with patch(
+            "backend.app.services.question_bank.load_role_questions",
+            return_value=[],
+        ) as load_bank:
+            result = expression_service.drill_question(
+                "ai_app_dev",
+                "RAG 分块",
+                [],
+                "wrong_review",
+                "mistake",
+                review_id,
+            )
+
+        load_bank.assert_not_called()
+        self.assertEqual("mistake", result["source_type"])
+        self.assertEqual(review_id, result["source_ref"])
+        self.assertIn(question["stem"], result["question"])
+        self.assertIn("正确答案：B. 避免上下文被边界切断", result["reference_answer"])
+        self.assertIn("Overlap 让相邻块保留重叠内容。", result["reference_answer"])
+        self.assertEqual("RAG 讲义", result["source_title"])
+        self.assertEqual("RAG 分块", result["section"])
+
+    def test_expression_question_rejects_missing_wrong_review_record(self):
+        with self.assertRaisesRegex(
+            expression_service.ExpressionError,
+            "复盘记录不存在",
+        ):
+            expression_service.drill_question(
+                "ai_app_dev",
+                "RAG 分块",
+                [],
+                "wrong_review",
+                "mistake",
+                "rv_missing",
+            )
+
     def test_slow_generation_returns_close_question_quickly(self):
         expression_dir = self.data_dir / "expression"
         question_item = {
