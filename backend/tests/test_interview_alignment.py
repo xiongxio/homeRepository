@@ -38,7 +38,7 @@ class InterviewAlignmentSmokeTests(unittest.TestCase):
     def _mock_chat_json(self, payload):
         return patch.object(
             interview_router.llm_service,
-            "chat_json_messages",
+            "chat_json",
             return_value=payload,
         )
 
@@ -53,14 +53,15 @@ class InterviewAlignmentSmokeTests(unittest.TestCase):
         ]
         captured = {}
 
-        def fake_chat_json(messages, **kwargs):
-            captured["messages"] = messages
+        def fake_chat_json(system, user, **kwargs):
+            captured["system"] = system
+            captured["user"] = user
             captured["kwargs"] = kwargs
             return {"questions": fake_questions}
 
         with patch.object(
             interview_router.llm_service,
-            "chat_json_messages",
+            "chat_json",
             side_effect=fake_chat_json,
         ):
             response = self.client.post(
@@ -77,10 +78,48 @@ class InterviewAlignmentSmokeTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(10, len(body["questions"]))
         self.assertEqual("核心问题 1", body["questions"][0]["question"])
-        self.assertIn("40-60", captured["messages"][0]["content"])
-        self.assertIn("目标公司", captured["messages"][1]["content"])
-        self.assertIn("测试科技", captured["messages"][1]["content"])
-        self.assertIn("必须恰好输出 10 个", captured["messages"][0]["content"])
+        self.assertIn("40-60", captured["system"])
+        self.assertIn("目标公司", captured["user"])
+        self.assertIn("测试科技", captured["user"])
+        self.assertIn("必须恰好输出【本次生成数量】", captured["system"])
+
+    def test_top_questions_generates_one_new_question(self):
+        captured = {}
+
+        def fake_chat_json(system, user, **kwargs):
+            captured["user"] = user
+            return {
+                "questions": [
+                    {
+                        "question": "请讲一个你定位过的线上问题。",
+                        "focus": "定位与复盘能力",
+                        "reference_answer": "先给结论，再讲定位过程。",
+                    }
+                ]
+            }
+
+        with patch.object(
+            interview_router.llm_service,
+            "chat_json",
+            side_effect=fake_chat_json,
+        ):
+            response = self.client.post(
+                "/api/interview/top-questions",
+                json={
+                    "company": "测试科技",
+                    "jd": "负责大模型应用测试",
+                    "resume": "负责过 RAG 评测",
+                    "role_key": "ai_qa",
+                    "count": 1,
+                    "existing_questions": ["已有题目：如何设计评测集？"],
+                },
+            )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual(1, len(body["questions"]))
+        self.assertIn("【本次生成数量】\n1", captured["user"])
+        self.assertIn("已有题目：如何设计评测集？", captured["user"])
 
     def test_interview_answer_returns_40_60_reference(self):
         captured = {}
@@ -187,7 +226,48 @@ class InterviewAlignmentSmokeTests(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         self.assertEqual("请先做个自我介绍。", response.json()["speech"])
+        self.assertFalse(response.json()["is_new_question"])
         user_content = captured["messages"][1]["content"]
         self.assertIn("【目标公司】", user_content)
         self.assertIn("测试科技", user_content)
         self.assertIn("40-60 秒", captured["messages"][0]["content"])
+
+    def test_interview_turn_follows_planned_questions(self):
+        captured = {}
+
+        def fake_chat_json(messages, **kwargs):
+            captured["messages"] = messages
+            return {
+                "speech": "你刚才提到覆盖了 200 个接口，具体怎么保证稳定性？",
+                "is_new_question": True,
+                "is_final": False,
+                "note": "",
+            }
+
+        with patch.object(
+            interview_router.llm_service,
+            "chat_json_messages",
+            side_effect=fake_chat_json,
+        ):
+            response = self.client.post(
+                "/api/interview/turn",
+                json={
+                    "company": "测试科技",
+                    "jd": "负责接口自动化测试",
+                    "resume": "覆盖 200 个接口",
+                    "role_key": "software_qa",
+                    "history": [
+                        {"role": "interviewer", "content": "请先做个自我介绍。"},
+                        {"role": "candidate", "content": "我有五年测试经验。"},
+                    ],
+                    "asked_count": 0,
+                    "max_questions": 3,
+                    "planned_questions": ["问题 A", "问题 B", "问题 C"],
+                },
+            )
+
+        self.assertEqual(200, response.status_code)
+        user_content = captured["messages"][1]["content"]
+        self.assertIn("【本场面试题目提纲", user_content)
+        self.assertIn("问题 A", user_content)
+        self.assertIn("下一道主问题应为：问题 A", user_content)

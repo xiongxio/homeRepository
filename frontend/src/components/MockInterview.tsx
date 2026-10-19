@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  isAbortError,
   listInterviewRoles,
   listTTSVoices,
   requestInterviewAnswer,
@@ -94,11 +95,17 @@ export function MockInterview({
   const [error, setError] = useState('')
   const [topQuestions, setTopQuestions] = useState<InterviewTopQuestion[] | null>(null)
   const [topLoading, setTopLoading] = useState(false)
+  const [topProgress, setTopProgress] = useState<{ current: number; total: number } | null>(
+    null,
+  )
   const [expandedTop, setExpandedTop] = useState<number | null>(null)
   const [answerData, setAnswerData] = useState<InterviewAnswerResponse | null>(null)
   const [answerLoading, setAnswerLoading] = useState(false)
   const knowledgeRef = useRef('')
   const scrollRef = useRef<HTMLDivElement | null>(null)
+  // 生成题目提纲时，用户可能切换岗位或题量；用世代号让旧请求的结果自动作废。
+  const topTokenRef = useRef(0)
+  const topAbortRef = useRef<AbortController | null>(null)
   // 试听音频不走 useSpeech，需要单独持有引用才能在切换岗位时停掉。
   const previewAudioRef = useRef<HTMLAudioElement | null>(null)
   const previewUrlRef = useRef('')
@@ -186,6 +193,12 @@ export function MockInterview({
       stopSpeaking()
       stopListening()
       setIsThinking(false)
+      topAbortRef.current?.abort()
+      topAbortRef.current = null
+      topTokenRef.current += 1
+      setTopLoading(false)
+      setTopProgress(null)
+      setError('')
       setRoleKey(nextKey)
       setTopQuestions(null)
       setExpandedTop(null)
@@ -200,6 +213,19 @@ export function MockInterview({
   const activeRole = roleOptions.find((item) => item.key === roleKey)
   // JD 留空时用岗位默认 JD 兜底，用户自己填了就以他填的为准。
   const effectiveJd = jd.trim() || activeRole?.default_jd || ''
+
+  const handleMaxQuestionsChange = (count: number) => {
+    if (count === maxQuestions) return
+    topAbortRef.current?.abort()
+    topAbortRef.current = null
+    topTokenRef.current += 1
+    setTopLoading(false)
+    setTopProgress(null)
+    setMaxQuestions(count)
+    setTopQuestions(null)
+    setExpandedTop(null)
+    setError('')
+  }
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -224,6 +250,10 @@ export function MockInterview({
           max_questions: maxQuestions,
           resume_id: resumeId,
           role_key: roleKey,
+          planned_questions:
+            topQuestions?.length === maxQuestions
+              ? topQuestions.map((item) => item.question)
+              : [],
         })
         // 请求期间若已切换岗位或重开面试，这一轮的结果不能再落到界面上。
         if (token !== turnTokenRef.current) return
@@ -259,6 +289,7 @@ export function MockInterview({
       resume,
       resumeId,
       maxQuestions,
+      topQuestions,
       roleKey,
       voiceMode,
       recognitionSupported,
@@ -390,43 +421,87 @@ export function MockInterview({
 
   const handleGenerateTopQuestions = async () => {
     if (topLoading) return
+    const token = topTokenRef.current + 1
+    topTokenRef.current = token
+    const total = maxQuestions
     setTopLoading(true)
+    setTopProgress({ current: 1, total })
     setError('')
+    setTopQuestions([])
+    setExpandedTop(null)
     let knowledge = knowledgeRef.current
-    if (hasKnowledge && !knowledge) {
-      try {
-        const query =
-          `${activeRole?.search_query ?? ''}\n${resume.slice(0, 400)}`.trim() ||
-          `${effectiveJd}\n${resume}`.trim() ||
-          '测试岗位'
-        const chunks = await searchKnowledge(query, 4)
-        knowledge = chunks
-          .map((chunk) => `[${chunk.title}] ${chunk.text}`)
-          .join('\n\n')
-        knowledgeRef.current = knowledge
-      } catch {
-        knowledge = ''
-      }
-    }
+    const controller = new AbortController()
+    topAbortRef.current?.abort()
+    topAbortRef.current = controller
+    // 整份提纲逐道生成，给整个流程一个明确上限，避免按钮无限转圈。
+    const timeoutId = window.setTimeout(() => controller.abort(), 240_000)
+    const generated: InterviewTopQuestion[] = []
     try {
-      const data = await requestTopQuestions({
-        company,
-        jd: effectiveJd,
-        resume,
-        knowledge,
-        resume_id: resumeId,
-        role_key: roleKey,
-      })
-      setTopQuestions(data.questions)
-      setExpandedTop(null)
+      if (hasKnowledge && !knowledge) {
+        try {
+          const query =
+            `${activeRole?.search_query ?? ''}\n${resume.slice(0, 400)}`.trim() ||
+            `${effectiveJd}\n${resume}`.trim() ||
+            '测试岗位'
+          const chunks = await searchKnowledge(query, 4, controller.signal)
+          knowledge = chunks
+            .map((chunk) => `[${chunk.title}] ${chunk.text}`)
+            .join('\n\n')
+          knowledgeRef.current = knowledge
+        } catch {
+          if (token !== topTokenRef.current) return
+          knowledge = ''
+        }
+      }
+      for (let index = 0; index < total; index += 1) {
+        if (token !== topTokenRef.current) return
+        setTopProgress({ current: index + 1, total })
+        const requestOne = () =>
+          requestTopQuestions(
+            {
+              company,
+              jd: effectiveJd,
+              resume,
+              knowledge,
+              resume_id: resumeId,
+              role_key: roleKey,
+              count: 1,
+              existing_questions: generated.map((item) => item.question),
+            },
+            controller.signal,
+          )
+        let data
+        try {
+          data = await requestOne()
+        } catch (questionError) {
+          if (isAbortError(questionError)) throw questionError
+          // 单题偶发截断或上游抖动时重试一次，不中断整份提纲。
+          data = await requestOne()
+        }
+        if (token !== topTokenRef.current) return
+        if (!Array.isArray(data?.questions) || data.questions.length === 0) {
+          throw new Error(`第 ${index + 1} 道题未返回有效内容，请重试。`)
+        }
+        generated.push(data.questions[0])
+        setTopQuestions([...generated])
+      }
     } catch (topError) {
+      if (token !== topTokenRef.current) return
+      const partial = generated.length > 0 ? `已生成 ${generated.length}/${total} 道，` : ''
       setError(
-        topError instanceof Error
-          ? topError.message
-          : '核心问题生成失败，请重试。',
+        isAbortError(topError)
+          ? `${partial}生成超时。请检查模型服务是否可用，或稍后重试。`
+          : topError instanceof Error
+            ? `${partial}${topError.message}`
+            : `${partial}题目提纲生成失败，请重试。`,
       )
     } finally {
-      setTopLoading(false)
+      window.clearTimeout(timeoutId)
+      if (topAbortRef.current === controller) topAbortRef.current = null
+      if (token === topTokenRef.current) {
+        setTopLoading(false)
+        setTopProgress(null)
+      }
     }
   }
 
@@ -523,13 +598,13 @@ export function MockInterview({
         </p>
 
         <div className="mt-4">
-          <span className="field-label">提问数量</span>
+          <span className="field-label">本场题量</span>
           <div className="inline-flex rounded-lg border border-zinc-300 bg-zinc-100 p-1">
             {QUESTION_OPTIONS.map((count) => (
               <button
                 key={count}
                 type="button"
-                onClick={() => setMaxQuestions(count)}
+                onClick={() => handleMaxQuestionsChange(count)}
                 className={`rounded-md px-4 py-1.5 text-sm font-semibold ${
                   maxQuestions === count
                     ? 'bg-white text-zinc-900 shadow-sm'
@@ -540,6 +615,9 @@ export function MockInterview({
               </button>
             ))}
           </div>
+          <p className="mt-2 text-xs leading-5 text-zinc-500">
+            生成题目提纲和模拟面试的主问题数都按这个数量执行。
+          </p>
         </div>
 
         <label className="mt-4 flex items-center gap-2 text-sm text-zinc-700">
@@ -635,20 +713,58 @@ export function MockInterview({
             ) : (
               <ListChecks className="size-4" aria-hidden="true" />
             )}
-            {topLoading ? '正在生成 10 个核心问题' : '生成最可能的 10 个核心问题'}
+            {topLoading
+              ? `正在生成第 ${topProgress?.current ?? 1}/${topProgress?.total ?? maxQuestions} 道`
+              : '生成本场题目提纲'}
           </button>
+          <p className="mt-2 text-xs leading-5 text-zinc-500">
+            按上方题量逐道生成，生成后模拟面试会按这份提纲顺序提问。
+          </p>
         </div>
+
+        {topLoading && (
+          <p
+            role="status"
+            aria-live="polite"
+            className="mt-2 flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800"
+          >
+            <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin" aria-hidden="true" />
+            <span>
+              正在逐道生成第 {topProgress?.current ?? 1}/{topProgress?.total ?? maxQuestions} 道，
+              通常需要几秒到几十秒，请稍候。
+            </span>
+          </p>
+        )}
+
+        {activeError && (
+          <p
+            role="alert"
+            className="mt-2 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700"
+          >
+            <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+            <span>{activeError}</span>
+          </p>
+        )}
 
         {topQuestions && topQuestions.length > 0 && (
           <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-4">
             <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-semibold text-zinc-800">
-                核心问题 TOP{Math.min(topQuestions.length, 10)}
+                本场题目提纲（{topQuestions.length}/{maxQuestions} 道）
               </p>
               <p className="text-xs text-zinc-500">
                 参考答案按 40-60 秒口播设计
               </p>
             </div>
+            <p className="mt-1 text-xs leading-5 text-emerald-700">
+              模拟面试会按这份提纲的顺序提问。
+            </p>
+            {topQuestions.length < maxQuestions && !topLoading && (
+              <p className="mt-1 text-xs leading-5 text-amber-700">
+                提纲未生成完整，缺少 {maxQuestions - topQuestions.length} 道；可以重新生成，
+                未完整时面试官会自由提问。
+              </p>
+            )}
             <ol className="mt-3 space-y-2">
               {topQuestions.map((item, index) => {
                 const expanded = expandedTop === index
@@ -691,9 +807,14 @@ export function MockInterview({
           </div>
         )}
 
-        <button type="button" className="primary-btn mt-5 w-full py-3" onClick={handleStart}>
+        <button
+          type="button"
+          className="primary-btn mt-5 w-full py-3"
+          onClick={handleStart}
+          disabled={topLoading}
+        >
           <Mic className="size-5" aria-hidden="true" />
-          开始模拟面试
+          {topQuestions?.length === maxQuestions ? '开始模拟面试（按提纲）' : '开始模拟面试'}
         </button>
       </section>
     )
@@ -727,7 +848,7 @@ export function MockInterview({
         </div>
         <div className="flex items-center gap-2">
           <span className="rounded-lg bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-600">
-            {Math.min(askedCount, maxQuestions)} / {maxQuestions} 题
+            主问题 {Math.min(askedCount, maxQuestions)} / {maxQuestions}
           </span>
           {usingFallbackVoice && (
             <span

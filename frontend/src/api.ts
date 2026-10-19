@@ -35,9 +35,19 @@ import type {
 const API_BASE = '/api'
 
 async function readErrorMessage(response: Response): Promise<string> {
+  const fallback =
+    response.status === 404
+      ? '接口不存在（404）。如果刚更新过代码，请重启后端服务后重试。'
+      : `请求失败（${response.status}）`
   try {
     const data = await response.json()
-    if (typeof data?.detail === 'string') return data.detail
+    if (
+      typeof data?.detail === 'string' &&
+      data.detail.trim() &&
+      data.detail.trim() !== 'Not Found'
+    ) {
+      return data.detail
+    }
     const details = data?.detail
     if (Array.isArray(details)) {
       return details
@@ -48,7 +58,7 @@ async function readErrorMessage(response: Response): Promise<string> {
   } catch {
     // Fall through to the HTTP status text.
   }
-  return `请求失败（${response.status}）`
+  return fallback
 }
 
 async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -448,12 +458,16 @@ export async function requestTopQuestions(
     knowledge?: string
     resume_id?: string
     role_key?: string
+    count?: number
+    existing_questions?: string[]
   },
+  signal?: AbortSignal,
 ): Promise<{ questions: InterviewTopQuestion[] }> {
   return apiFetch<{ questions: InterviewTopQuestion[] }>('/interview/top-questions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
+    signal,
   })
 }
 

@@ -140,6 +140,7 @@ export interface InterviewTurnRequest {
   max_questions: number
   resume_id?: string
   role_key?: string
+  planned_questions?: string[]
 }
 
 export interface InterviewRoleOption {

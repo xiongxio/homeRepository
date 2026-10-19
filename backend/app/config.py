@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     ark_api_key: str = ""
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     ark_model: str = "doubao-seed-2-1-pro-260628"
+    # 核心问题带参考答案，输出较长；可单独指定更快的生成通道。
+    top_questions_provider: str = ""
+    top_questions_model: str = ""
     minimax_api_key: str = ""
     minimax_base_url: str = "https://api.minimaxi.com/v1"
     minimax_model: str = "MiniMax-M2"

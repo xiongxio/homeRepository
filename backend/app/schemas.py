@@ -73,6 +73,7 @@ class InterviewTurnRequest(BaseModel):
     max_questions: int = Field(default=6, ge=1, le=20)
     resume_id: str = ""
     role_key: str = ""
+    planned_questions: list[str] = Field(default_factory=list)
 
 
 class InterviewAnswerRequest(BaseModel):
@@ -93,6 +94,8 @@ class TopQuestionsRequest(BaseModel):
     knowledge: str = ""
     resume_id: str = ""
     role_key: str = ""
+    count: int = Field(default=10, ge=1, le=10)
+    existing_questions: list[str] = Field(default_factory=list)
 
 
 class ResumeFileRequest(BaseModel):
