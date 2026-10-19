@@ -1,4 +1,4 @@
-import { CheckCircle2, ChevronLeft, Loader2, Send } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, ChevronLeft, Loader2, Send } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { submitQuiz } from '../api'
 import type { QuizAttempt, QuizPaper, QuizQuestion } from '../types'
@@ -80,6 +80,15 @@ export function QuizRunner({ paper, onGraded, onCancel }: QuizRunnerProps) {
           style={{ width: `${(answeredCount / paper.questions.length) * 100}%` }}
         />
       </div>
+
+      {paper.generation_context?.kind === 'mistake_redo_fallback' && (
+        <p className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          <span>
+            本次 AI 变形题生成不足，已使用错题本原题按题型配比补齐；可以正常作答并继续记录错题。
+          </span>
+        </p>
+      )}
 
       <ol className="mt-5 space-y-5">
         {paper.questions.map((question, index) => {

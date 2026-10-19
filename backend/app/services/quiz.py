@@ -2002,6 +2002,152 @@ def _mistake_item_doc_ids(items: list[dict]) -> list[str]:
     return doc_ids
 
 
+def _mistake_answer_keys(value) -> list[str]:
+    if isinstance(value, list):
+        raw = value
+    elif isinstance(value, str):
+        raw = re.split(r"[,，;；\s]+", value)
+    else:
+        raw = []
+    keys: list[str] = []
+    for item in raw:
+        key = str(item).strip().upper()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _mistake_to_question(
+    mistake: dict,
+    index: int,
+    difficulty: str,
+) -> dict | None:
+    """把错题本记录还原成可判分的试卷题目。"""
+    qtype = str(mistake.get("type") or "").strip().lower()
+    if qtype not in VALID_TYPES:
+        return None
+    stem = str(mistake.get("stem") or "").strip()
+    options: list[dict] = []
+    for option in mistake.get("options") or []:
+        if not isinstance(option, dict):
+            continue
+        key = str(option.get("key") or "").strip().upper()
+        text = str(option.get("text") or "").strip()
+        if key and text:
+            options.append({"key": key, "text": text})
+    if not stem or len(options) < 2:
+        return None
+    valid_keys = {option["key"] for option in options}
+    answer = [
+        key for key in _mistake_answer_keys(mistake.get("correct_answer")) if key in valid_keys
+    ]
+    if not answer:
+        return None
+    if qtype in ("single", "judge"):
+        answer = answer[:1]
+    source_docs = [
+        {"doc_id": str(doc.get("doc_id") or ""), "title": str(doc.get("title") or "")}
+        for doc in (mistake.get("source_docs") or [])
+        if isinstance(doc, dict) and doc.get("doc_id")
+    ]
+    source_doc_id = str(mistake.get("source_doc_id") or "").strip()
+    if source_doc_id and not any(doc["doc_id"] == source_doc_id for doc in source_docs):
+        source_docs.insert(
+            0,
+            {"doc_id": source_doc_id, "title": str(mistake.get("source_title") or "")},
+        )
+    return {
+        "question_id": f"q{index}",
+        "type": qtype,
+        "stem": stem,
+        "options": options,
+        "answer": answer,
+        "explanation": str(mistake.get("explanation") or "").strip(),
+        "topic": str(mistake.get("topic") or "未分类").strip() or "未分类",
+        "difficulty": difficulty,
+        "source_title": str(mistake.get("source_title") or "").strip(),
+        "source_doc_id": source_doc_id,
+        "source_docs": source_docs,
+        "source_chunk_ids": [
+            str(item).strip()
+            for item in (mistake.get("source_chunk_ids") or [])
+            if str(item).strip()
+        ],
+    }
+
+
+def _build_mistake_fallback_paper(
+    mistakes: list[dict],
+    counts: dict[str, int],
+    difficulty: str,
+    keywords: list[str],
+) -> dict | None:
+    """模型变形题不足时，按题型配比用原错题补成一张可练的卷子。"""
+    questions: list[dict] = []
+    used_stems: set[str] = set()
+
+    def take(qtype: str, quota: int) -> None:
+        for mistake in mistakes:
+            if len(questions) >= sum(counts.values()):
+                return
+            if sum(1 for item in questions if item["type"] == qtype) >= quota:
+                return
+            if str(mistake.get("type") or "").strip().lower() != qtype:
+                continue
+            stem = str(mistake.get("stem") or "").strip()
+            if not stem or stem in used_stems:
+                continue
+            question = _mistake_to_question(mistake, len(questions) + 1, difficulty)
+            if not question:
+                continue
+            used_stems.add(stem)
+            questions.append(question)
+
+    for qtype in VALID_TYPES:
+        take(qtype, max(0, counts.get(qtype, 0)))
+
+    # 某个题型原题不足时，用其他题型补足总题量。
+    if len(questions) < sum(counts.values()):
+        for mistake in mistakes:
+            if len(questions) >= sum(counts.values()):
+                break
+            stem = str(mistake.get("stem") or "").strip()
+            if not stem or stem in used_stems:
+                continue
+            question = _mistake_to_question(mistake, len(questions) + 1, difficulty)
+            if not question:
+                continue
+            used_stems.add(stem)
+            questions.append(question)
+
+    if not questions:
+        return None
+    for index, question in enumerate(questions, start=1):
+        question["question_id"] = f"q{index}"
+
+    source_docs: list[dict] = []
+    seen_doc_ids: set[str] = set()
+    for question in questions:
+        for doc in question.get("source_docs") or []:
+            doc_id = str(doc.get("doc_id") or "")
+            if doc_id and doc_id not in seen_doc_ids:
+                seen_doc_ids.add(doc_id)
+                source_docs.append(dict(doc))
+
+    return {
+        "paper_id": uuid.uuid4().hex,
+        "title": "错题重练（原题回顾）",
+        "keywords": list(dict.fromkeys(keywords)),
+        "doc_titles": [doc["title"] for doc in source_docs if doc.get("title")],
+        "doc_ids": [doc["doc_id"] for doc in source_docs if doc.get("doc_id")],
+        "source_docs": source_docs,
+        "source_chunks": [],
+        "difficulty": difficulty,
+        "questions": questions,
+        "created_at": int(time.time()),
+    }
+
+
 def generate_mistake_paper(
     limit: int = 8,
     difficulty: str = "mixed",
@@ -2013,6 +2159,7 @@ def generate_mistake_paper(
 ) -> dict:
     """按本次错题或累计错题的知识点重新生成变形题。"""
     source_attempt_id = attempt_id or (_latest_attempt_id() if scope == "current" else "")
+    fallback_mistakes: list[dict] = []
     if scope == "current":
         topics = _current_mistake_topics(attempt_id, limit)
         doc_ids = _mistake_source_doc_ids(topics)
@@ -2042,6 +2189,7 @@ def generate_mistake_paper(
 
         requested_total = total if total is not None else max(1, limit)
         counts, picked_mistakes = _type_preserving_plan(filtered, requested_total)
+        fallback_mistakes = picked_mistakes
         topics = []
         for item in picked_mistakes:
             topic = str(item.get("topic") or "未分类")
@@ -2051,23 +2199,48 @@ def generate_mistake_paper(
         if not doc_ids:
             doc_ids = _mistake_source_doc_ids(topics)
 
-    paper = generate_paper(
-        topics,
-        doc_ids,
-        single=counts["single"],
-        multiple=counts["multiple"],
-        judge=counts["judge"],
-        difficulty=difficulty,
-        focus_weak=True,
-    )
+    fallback_reason = ""
+    try:
+        paper = generate_paper(
+            topics,
+            doc_ids,
+            single=counts["single"],
+            multiple=counts["multiple"],
+            judge=counts["judge"],
+            difficulty=difficulty,
+            focus_weak=True,
+        )
+    except (QuizError, llm_service.LlmError) as exc:
+        paper = (
+            _build_mistake_fallback_paper(
+                fallback_mistakes,
+                counts,
+                difficulty,
+                list(topics or []),
+            )
+            if fallback_mistakes
+            else None
+        )
+        if not paper:
+            raise
+        fallback_reason = (
+            "AI 变形题不足或模型暂时不可用，已使用错题本中的原题按题型配比补齐。"
+        )
+        quiz_logger.warning(
+            "mistake paper fallback requested=%s picked=%d reason=%s",
+            total,
+            len(fallback_mistakes),
+            exc,
+        )
     paper["generation_context"] = {
-        "kind": "mistake_redo",
+        "kind": "mistake_redo_fallback" if fallback_reason else "mistake_redo",
         "scope": scope,
         "source_attempt_id": source_attempt_id,
         "time_range": time_range if scope == "all" else "",
         "requested_total": total if scope == "all" and total is not None else None,
         "selected_topics": list(topics or []),
         "question_type_plan": dict(counts),
+        "fallback_reason": fallback_reason,
     }
     _write_json(PAPERS_DIR / f"{paper['paper_id']}.json", paper)
     return paper
