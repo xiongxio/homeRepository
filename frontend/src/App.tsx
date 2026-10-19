@@ -452,7 +452,7 @@ export default function App() {
     <div className="min-h-screen bg-zinc-100">
       <header className="border-b border-zinc-200 bg-white">
         <div
-          className={`mx-auto flex items-center justify-between gap-4 py-4 ${
+          className={`mx-auto flex flex-col items-stretch gap-3 py-4 sm:flex-row sm:items-center sm:justify-between sm:gap-4 ${
             view === 'quiz' ? 'max-w-[1800px] px-3' : 'max-w-6xl px-4'
           }`}
         >
@@ -465,8 +465,8 @@ export default function App() {
               <p className="text-xs text-zinc-500">录音复盘 · 逐题评分 · 知识库引用</p>
             </div>
           </div>
-          <div className="flex flex-wrap items-center justify-end gap-2">
-            <div className="inline-flex h-10 items-stretch rounded-lg border border-zinc-300 bg-zinc-100 p-1">
+          <div className="flex w-full flex-wrap items-center justify-start gap-2 whitespace-nowrap sm:w-auto sm:justify-end">
+            <div className="inline-flex h-10 items-stretch rounded-lg border border-zinc-300 bg-zinc-100 p-1 [&>button]:gap-1 [&>button]:px-2 [&>button]:text-xs [&_svg]:size-3.5 sm:[&>button]:gap-1.5 sm:[&>button]:px-3 sm:[&>button]:text-sm sm:[&_svg]:size-4">
               <button
                 type="button"
                 className={`inline-flex items-center gap-1.5 rounded-md px-3 text-sm font-medium transition ${
