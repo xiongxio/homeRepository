@@ -449,6 +449,41 @@ class ReviewScheduleTests(unittest.TestCase):
         self.assertIn("避免上下文被边界切断", result["reference_answer"])
         self.assertNotIn("B.", result["reference_answer"])
 
+    def test_mistake_fallback_strips_option_by_option_analysis(self):
+        record = self._question(
+            topic="auto-compact",
+            stem="auto-compact 的作用是什么？",
+            correct="B",
+        )
+        record.update(
+            {
+                "options": [
+                    {"key": "A", "text": "只做日志轮转"},
+                    {
+                        "key": "B",
+                        "text": "在上下文变长时硬压缩历史，使连续上下文继续可用",
+                    },
+                ],
+                "explanation": (
+                    "Claude Code 靠 auto-compact 在上下文变长时硬压缩历史，"
+                    "让连续上下文继续用下去，这也带来上下文越多行为越激进的特点。"
+                    "B 是 WorkBuddy 派生子 Agent 的分层思路；"
+                    "C 是任务清单持久化机制；"
+                    "D 描述的是确定性反馈，与 auto-compact 的压缩职责无关。"
+                ),
+            }
+        )
+
+        answer = expression_service._mistake_spoken_reference([record])
+
+        self.assertIn("硬压缩历史", answer)
+        self.assertIn("上下文越多行为越激进", answer)
+        self.assertNotIn("B 是", answer)
+        self.assertNotIn("C 是", answer)
+        self.assertNotIn("D 描述", answer)
+        self.assertNotIn("无关", answer)
+        self.assertLessEqual(len(answer), 260)
+
     def test_expression_question_rejects_missing_wrong_review_record(self):
         with self.assertRaisesRegex(
             expression_service.ExpressionError,

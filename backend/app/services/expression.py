@@ -637,25 +637,68 @@ def _mistake_answer_text(record: dict) -> str:
     return "、".join(sorted(answer_keys))
 
 
+OPTION_SENTENCE_RE = re.compile(
+    r"^(?:选项\s*[A-DＡ-Ｄ]|第\s*[A-DＡ-Ｄ]\s*项|[A-DＡ-Ｄ]\s*[.、．:：)）]|[A-DＡ-Ｄ]\s+)",
+    re.IGNORECASE,
+)
+OPTION_COMPARE_RE = re.compile(
+    r"[A-DＡ-Ｄ]\s*(?:是|描述|对应|属于|表示|强调|说的)",
+    re.IGNORECASE,
+)
+
+
+def _humanize_mistake_answer(text: str, max_sentences: int = 2) -> str:
+    """清掉逐项点评式的真题解析，只保留能直接口述的结论和原因。"""
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return ""
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[。；;！!？?])", normalized)
+        if sentence.strip()
+    ]
+    kept: list[str] = []
+    for sentence in sentences:
+        if OPTION_SENTENCE_RE.match(sentence):
+            continue
+        if OPTION_COMPARE_RE.search(sentence):
+            continue
+        if kept and "无关" in sentence:
+            continue
+        sentence = re.sub(r"^(?:解析|答案|正确答案)[：:]\s*", "", sentence)
+        if sentence:
+            kept.append(sentence)
+        if len(kept) >= max_sentences:
+            break
+    return "".join(kept).strip()
+
+
 def _mistake_spoken_reference(records: list[dict]) -> str:
-    """不用 LLM 时，也从解析和正确选项文本拼出口语答案，不回显选项编号。"""
+    """不用 LLM 时，用正确选项和清洗后的解析拼一段简洁口语答案。"""
     parts: list[str] = []
     seen: set[str] = set()
     for record in records:
-        explanation = str(record.get("explanation") or "").strip()
+        explanation = _humanize_mistake_answer(
+            str(record.get("explanation") or ""),
+            max_sentences=2,
+        )
         answer = _mistake_answer_text(record)
         if explanation and answer and answer not in explanation:
-            sentence = f"{explanation} 核心结论是：{answer}。"
+            sentence = f"简单说，{answer}。{explanation}"
+        elif explanation:
+            sentence = explanation
+        elif answer:
+            sentence = f"简单说，{answer}。"
         else:
-            sentence = explanation or (f"核心结论是：{answer}。" if answer else "")
+            sentence = ""
         normalized = _keyword_norm(sentence)
         if not sentence or normalized in seen:
             continue
         seen.add(normalized)
         parts.append(sentence)
-        if len(parts) >= 3:
+        if len(parts) >= 2:
             break
-    return "\n".join(parts)
+    return "\n".join(parts)[:260].rstrip()
 
 
 def _mistake_open_question(topic: str) -> str:
@@ -724,6 +767,14 @@ def _generate_mistake_question_via_llm(
     # 模型偶尔仍会输出选择题口吻，这种结果直接丢弃并走兜底。
     if _looks_like_choice_question(question):
         return None
+    if (
+        OPTION_SENTENCE_RE.search(reference_answer)
+        or OPTION_COMPARE_RE.search(reference_answer)
+    ):
+        reference_answer = _humanize_mistake_answer(
+            reference_answer,
+            max_sentences=4,
+        )
     keywords = [
         str(item).strip()
         for item in (raw.get("keywords") or [])
@@ -735,6 +786,14 @@ def _generate_mistake_question_via_llm(
         if str(item).strip()
     ]
     reference_script = str(raw.get("reference_script") or "").strip()
+    if (
+        OPTION_SENTENCE_RE.search(reference_script)
+        or OPTION_COMPARE_RE.search(reference_script)
+    ):
+        reference_script = _humanize_mistake_answer(
+            reference_script,
+            max_sentences=4,
+        )
     source_title = str(raw.get("source_title") or "").strip()
     return {
         "question": question,
