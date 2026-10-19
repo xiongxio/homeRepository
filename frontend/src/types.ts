@@ -671,6 +671,37 @@ export interface QuizProgress {
   scope_note: string
 }
 
+export interface QuizDocumentTopicStat {
+  topic: string
+  total: number
+  correct: number
+  accuracy: number
+  streak: number
+}
+
+export interface QuizDocumentStat {
+  doc_id: string
+  title: string
+  total: number
+  correct: number
+  accuracy: number
+  attempt_count: number
+  active_mistake_count: number
+  weak_topics: QuizDocumentTopicStat[]
+  topics: QuizDocumentTopicStat[]
+  attribution: {
+    exact: number
+    paper: number
+    title: number
+  }
+}
+
+export interface QuizDocumentProgress {
+  documents: QuizDocumentStat[]
+  no_data_docs: Array<{ doc_id: string; title: string }>
+  unattributed_total: number
+}
+
 export interface QuizGenerateRequest {
   keywords: string[]
   doc_ids?: string[]

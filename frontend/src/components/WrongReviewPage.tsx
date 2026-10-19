@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  FileText,
   GraduationCap,
   Layers,
   Loader2,
@@ -17,7 +18,9 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
+  generateQuizPaper,
   generateReviewPractice,
+  getQuizDocumentProgress,
   getQuizProgress,
   getReviewDashboard,
   listReviewRecords,
@@ -26,6 +29,7 @@ import {
 } from '../api'
 import type {
   QuizPaper,
+  QuizDocumentProgress,
   QuizProgress,
   ReviewDashboard,
   ReviewRecord,
@@ -120,6 +124,7 @@ export function WrongReviewPage({
   const [dashboard, setDashboard] = useState<ReviewDashboard | null>(null)
   const [records, setRecords] = useState<ReviewRecord[]>([])
   const [progress, setProgress] = useState<QuizProgress | null>(null)
+  const [documentProgress, setDocumentProgress] = useState<QuizDocumentProgress | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [practiceBusy, setPracticeBusy] = useState('')
@@ -128,6 +133,9 @@ export function WrongReviewPage({
   const [statusFilter, setStatusFilter] = useState<RecordStatusFilter>('all')
   const [keyword, setKeyword] = useState('')
   const [selectedModule, setSelectedModule] = useState('')
+  const [knowledgeView, setKnowledgeView] = useState<'module' | 'document'>('module')
+  const [expandedDocument, setExpandedDocument] = useState('')
+  const [documentPracticeBusy, setDocumentPracticeBusy] = useState('')
   const [syncBusy, setSyncBusy] = useState(false)
   const [syncMessage, setSyncMessage] = useState('')
 
@@ -135,14 +143,16 @@ export function WrongReviewPage({
     setLoading(true)
     setError('')
     try {
-      const [nextDashboard, nextRecords, nextProgress] = await Promise.all([
+      const [nextDashboard, nextRecords, nextProgress, nextDocumentProgress] = await Promise.all([
         getReviewDashboard(),
         listReviewRecords(),
         getQuizProgress().catch(() => null),
+        getQuizDocumentProgress().catch(() => null),
       ])
       setDashboard(nextDashboard)
       setRecords(nextRecords)
       setProgress(nextProgress)
+      setDocumentProgress(nextDocumentProgress)
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '复盘数据加载失败。')
     } finally {
@@ -163,6 +173,40 @@ export function WrongReviewPage({
       setError(practiceError instanceof Error ? practiceError.message : '复盘练习组卷失败。')
     } finally {
       setPracticeBusy('')
+    }
+  }
+
+  const handleDocumentPractice = async (docId: string) => {
+    const doc = documentProgress?.documents.find((item) => item.doc_id === docId)
+    if (!doc) return
+    const keywords = doc.weak_topics
+      .slice()
+      .sort((left, right) => left.accuracy - right.accuracy || right.total - left.total)
+      .slice(0, 5)
+      .map((item) => item.topic)
+    setDocumentPracticeBusy(docId)
+    setError('')
+    try {
+      onPaperReady(
+        await generateQuizPaper({
+          keywords: keywords.length > 0 ? keywords : [doc.title],
+          doc_ids: [docId],
+          single: 5,
+          multiple: 3,
+          judge: 2,
+          difficulty: 'mixed',
+          focus_weak: true,
+          mode: 'normal',
+        }),
+      )
+    } catch (practiceError) {
+      setError(
+        practiceError instanceof Error
+          ? practiceError.message
+          : '文档定向组卷失败。',
+      )
+    } finally {
+      setDocumentPracticeBusy('')
     }
   }
 
@@ -591,100 +635,277 @@ export function WrongReviewPage({
 
       {!loading && tab === 'knowledge' && (
         <section className="tool-card">
-          <h3 className="text-sm font-semibold text-zinc-900">板块热力</h3>
-          <p className="mt-1 text-xs text-zinc-500">
-            红色低于 60%，黄色 60%–79%，绿色 80% 及以上。数据来自真实答题记录。
-          </p>
-          {moduleStats.length === 0 ? (
-            <p className="mt-4 text-sm text-zinc-500">还没有可展示的板块数据。</p>
-          ) : (
-            <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-              {moduleStats.map((module) => {
-                const active = activeModule === module.module
-                return (
-                  <button
-                    key={module.module}
-                    type="button"
-                    className={`rounded-lg border p-3.5 text-left transition ${
-                      active
-                        ? 'border-emerald-500 bg-emerald-50'
-                        : 'border-zinc-200 bg-zinc-50 hover:border-emerald-200'
-                    }`}
-                    onClick={() => setSelectedModule(module.module)}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate text-sm font-medium text-zinc-900">{moduleLabel(module.module)}</span>
-                      <span className="shrink-0 text-xs text-zinc-500">
-                        {Math.round(module.accuracy * 100)}%
-                      </span>
-                    </div>
-                    <div className="mt-2 h-2 overflow-hidden rounded-lg bg-zinc-200">
-                      <div
-                        className={`h-full rounded-lg ${accuracyColor(module.accuracy)}`}
-                        style={{ width: `${Math.max(4, module.accuracy * 100)}%` }}
-                      />
-                    </div>
-                    <p className="mt-2 text-xs text-zinc-500">
-                      {module.topic_count} 个知识点 · {module.active_mistake_count} 道待巩固
-                    </p>
-                  </button>
-                )
-              })}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-sm font-semibold text-zinc-900">知识地图</p>
+            <div
+              className="flex rounded-lg border border-zinc-300 bg-white p-0.5"
+              role="group"
+              aria-label="知识地图视图"
+            >
+              <button
+                type="button"
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                  knowledgeView === 'module'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-zinc-600 hover:bg-zinc-100'
+                }`}
+                onClick={() => setKnowledgeView('module')}
+                aria-pressed={knowledgeView === 'module'}
+              >
+                <Layers className="size-3.5" aria-hidden="true" />
+                板块热力
+              </button>
+              <button
+                type="button"
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                  knowledgeView === 'document'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-zinc-600 hover:bg-zinc-100'
+                }`}
+                onClick={() => setKnowledgeView('document')}
+                aria-pressed={knowledgeView === 'document'}
+              >
+                <FileText className="size-3.5" aria-hidden="true" />
+                文档热力
+              </button>
             </div>
-          )}
-          {activeModule && (
-            <div className="mt-5">
-              <p className="text-sm font-semibold text-zinc-900">{moduleLabel(activeModule)}</p>
-              {moduleTopics.length === 0 ? (
-                <p className="mt-2 text-sm text-zinc-500">这个板块还没有知识点样本。</p>
-              ) : (
-                <ul className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-                  {moduleTopics.map((topic) => (
-                    <li key={topic.topic} className="rounded-lg bg-zinc-50 p-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="truncate text-xs font-medium text-zinc-800">{topic.topic}</span>
-                        <span className="shrink-0 text-xs text-zinc-500">
-                          {Math.round(topic.accuracy * 100)}%
-                        </span>
-                      </div>
-                      <div className="mt-1.5 h-1.5 overflow-hidden rounded-lg bg-zinc-200">
-                        <div
-                          className={`h-full rounded-lg ${accuracyColor(topic.accuracy)}`}
-                          style={{ width: `${Math.max(4, topic.accuracy * 100)}%` }}
-                        />
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          )}
+          </div>
 
-          {activeModule && (
-            <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 p-3.5">
-              <p className="flex items-center gap-1.5 text-sm font-semibold text-amber-900">
-                <TrendingUp className="size-4" aria-hidden="true" />
-                优先巩固 · {moduleLabel(activeModule)}
+          {knowledgeView === 'document' && (
+            <div className="mt-4">
+              <h3 className="text-sm font-semibold text-zinc-900">文档热力</h3>
+              <p className="mt-1 text-xs text-zinc-500">
+                按原始知识文档聚合答题与待巩固错题，看整篇资料的整体掌握情况；归因口径为精确来源 / 单文档试卷 / 标题匹配。
               </p>
-              <p className="mt-1 text-xs leading-5 text-amber-800/80">
-                根据当前板块的样本量、正确率、题型覆盖和最近答题状态实时排序。
-              </p>
-              {priorityTopics.length === 0 ? (
-                <p className="mt-2 text-sm leading-6 text-amber-900">
-                  当前板块暂无明显薄弱点，保持间隔复习即可。
+              {documentProgress && documentProgress.unattributed_total > 0 && (
+                <p className="mt-1 text-xs text-amber-700">
+                  另有 {documentProgress.unattributed_total} 道历史题暂无法归因到具体文档，未计入下方统计。
+                </p>
+              )}
+              {!documentProgress ? (
+                <p className="mt-4 text-sm text-zinc-500">文档统计暂不可用。</p>
+              ) : documentProgress.documents.length === 0 ? (
+                <p className="mt-4 text-sm text-zinc-500">
+                  {documentProgress.unattributed_total > 0
+                    ? `已有答题记录但暂时无法归因到文档（${documentProgress.unattributed_total} 道），先按单篇文档出题后再看整体掌握度。`
+                    : '还没有针对单篇文档的答题记录，去在线刷题按文档出题后会在这里显示整体掌握度。'}
                 </p>
               ) : (
-                <ul className="mt-2 space-y-2">
-                  {priorityTopics.map((topic) => (
-                    <li key={topic.topic} className="text-sm leading-6 text-amber-900">
-                      <span className="font-medium">{topic.topic}</span>：{priorityAdvice(topic)}
-                    </li>
-                  ))}
-                </ul>
+                <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {documentProgress.documents.map((doc) => {
+                    const open = expandedDocument === doc.doc_id
+                    const attributionParts = [
+                      doc.attribution.exact > 0 ? `精确 ${doc.attribution.exact}` : '',
+                      doc.attribution.paper > 0 ? `试卷 ${doc.attribution.paper}` : '',
+                      doc.attribution.title > 0 ? `标题 ${doc.attribution.title}` : '',
+                    ].filter(Boolean)
+                    return (
+                      <div key={doc.doc_id} className="rounded-lg border border-zinc-200 bg-zinc-50 p-3.5">
+                        <div className="flex items-start justify-between gap-2">
+                          <span
+                            className="truncate text-sm font-medium text-zinc-900"
+                            title={doc.title}
+                          >
+                            {doc.title}
+                          </span>
+                          <span className="shrink-0 text-xs font-semibold text-zinc-700">
+                            {Math.round(doc.accuracy * 100)}%
+                          </span>
+                        </div>
+                        <div className="mt-2 h-2 overflow-hidden rounded-lg bg-zinc-200">
+                          <div
+                            className={`h-full rounded-lg ${accuracyColor(doc.accuracy)}`}
+                            style={{ width: `${Math.max(4, doc.accuracy * 100)}%` }}
+                          />
+                        </div>
+                        <p className="mt-2 text-xs text-zinc-500">
+                          {doc.total} 道 · {doc.attempt_count} 份答卷 ·{' '}
+                          {doc.active_mistake_count} 道待巩固
+                        </p>
+                        {attributionParts.length > 0 && (
+                          <p className="mt-1 text-xs text-zinc-400">
+                            {attributionParts.join(' · ')}
+                          </p>
+                        )}
+                        {doc.weak_topics.length > 0 ? (
+                          <div className="mt-2 flex flex-wrap gap-1">
+                            {doc.weak_topics.slice(0, 3).map((topic) => (
+                              <span
+                                key={topic.topic}
+                                className="rounded-md bg-amber-50 px-2 py-1 text-xs text-amber-800"
+                              >
+                                {topic.topic} {Math.round(topic.accuracy * 100)}%
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="mt-2 text-xs text-emerald-700">
+                            薄弱知识点低于阈值，保持间隔复习。
+                          </p>
+                        )}
+                        <div className="mt-3 flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            className="secondary-btn px-2.5 py-1.5 text-xs"
+                            onClick={() => setExpandedDocument(open ? '' : doc.doc_id)}
+                            aria-expanded={open}
+                          >
+                            {open ? (
+                              <ChevronDown className="size-3.5" aria-hidden="true" />
+                            ) : (
+                              <ChevronRight className="size-3.5" aria-hidden="true" />
+                            )}
+                            {open ? '收起知识点' : '展开知识点'}
+                          </button>
+                          <button
+                            type="button"
+                            className="primary-btn px-2.5 py-1.5 text-xs"
+                            onClick={() => void handleDocumentPractice(doc.doc_id)}
+                            disabled={documentPracticeBusy === doc.doc_id}
+                          >
+                            {documentPracticeBusy === doc.doc_id ? (
+                              <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                            ) : (
+                              <RotateCcw className="size-3.5" aria-hidden="true" />
+                            )}
+                            针对这篇文档再练
+                          </button>
+                        </div>
+                        {open && (
+                          <ul className="mt-3 space-y-2 border-t border-zinc-200 pt-3">
+                            {doc.topics.map((topic) => (
+                              <li
+                                key={topic.topic}
+                                className="flex items-center justify-between gap-2 text-xs"
+                              >
+                                <span className="truncate text-zinc-700">{topic.topic}</span>
+                                <span className="shrink-0 text-zinc-500">
+                                  {topic.total} 道 · {Math.round(topic.accuracy * 100)}%
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+              {documentProgress && documentProgress.no_data_docs.length > 0 && (
+                <div className="mt-4">
+                  <p className="text-sm font-semibold text-zinc-900">尚未针对该文档练习</p>
+                  <ul className="mt-2 flex flex-wrap gap-2">
+                    {documentProgress.no_data_docs.map((doc) => (
+                      <li
+                        key={doc.doc_id}
+                        className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs text-zinc-600"
+                      >
+                        {doc.title}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
             </div>
           )}
 
+          {knowledgeView === 'module' && (
+            <div className="mt-4">
+              <h3 className="text-sm font-semibold text-zinc-900">板块热力</h3>
+              <p className="mt-1 text-xs text-zinc-500">
+                红色低于 60%，黄色 60%–79%，绿色 80% 及以上。数据来自真实答题记录。
+              </p>
+              {moduleStats.length === 0 ? (
+                <p className="mt-4 text-sm text-zinc-500">还没有可展示的板块数据。</p>
+              ) : (
+                <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {moduleStats.map((module) => {
+                    const active = activeModule === module.module
+                    return (
+                      <button
+                        key={module.module}
+                        type="button"
+                        className={`rounded-lg border p-3.5 text-left transition ${
+                          active
+                            ? 'border-emerald-500 bg-emerald-50'
+                            : 'border-zinc-200 bg-zinc-50 hover:border-emerald-200'
+                        }`}
+                        onClick={() => setSelectedModule(module.module)}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="truncate text-sm font-medium text-zinc-900">{moduleLabel(module.module)}</span>
+                          <span className="shrink-0 text-xs text-zinc-500">
+                            {Math.round(module.accuracy * 100)}%
+                          </span>
+                        </div>
+                        <div className="mt-2 h-2 overflow-hidden rounded-lg bg-zinc-200">
+                          <div
+                            className={`h-full rounded-lg ${accuracyColor(module.accuracy)}`}
+                            style={{ width: `${Math.max(4, module.accuracy * 100)}%` }}
+                          />
+                        </div>
+                        <p className="mt-2 text-xs text-zinc-500">
+                          {module.topic_count} 个知识点 · {module.active_mistake_count} 道待巩固
+                        </p>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+              {activeModule && (
+                <div className="mt-5">
+                  <p className="text-sm font-semibold text-zinc-900">{moduleLabel(activeModule)}</p>
+                  {moduleTopics.length === 0 ? (
+                    <p className="mt-2 text-sm text-zinc-500">这个板块还没有知识点样本。</p>
+                  ) : (
+                    <ul className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                      {moduleTopics.map((topic) => (
+                        <li key={topic.topic} className="rounded-lg bg-zinc-50 p-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate text-xs font-medium text-zinc-800">{topic.topic}</span>
+                            <span className="shrink-0 text-xs text-zinc-500">
+                              {Math.round(topic.accuracy * 100)}%
+                            </span>
+                          </div>
+                          <div className="mt-1.5 h-1.5 overflow-hidden rounded-lg bg-zinc-200">
+                            <div
+                              className={`h-full rounded-lg ${accuracyColor(topic.accuracy)}`}
+                              style={{ width: `${Math.max(4, topic.accuracy * 100)}%` }}
+                            />
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              {activeModule && (
+                <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 p-3.5">
+                  <p className="flex items-center gap-1.5 text-sm font-semibold text-amber-900">
+                    <TrendingUp className="size-4" aria-hidden="true" />
+                    优先巩固 · {moduleLabel(activeModule)}
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-amber-800/80">
+                    根据当前板块的样本量、正确率、题型覆盖和最近答题状态实时排序。
+                  </p>
+                  {priorityTopics.length === 0 ? (
+                    <p className="mt-2 text-sm leading-6 text-amber-900">
+                      当前板块暂无明显薄弱点，保持间隔复习即可。
+                    </p>
+                  ) : (
+                    <ul className="mt-2 space-y-2">
+                      {priorityTopics.map((topic) => (
+                        <li key={topic.topic} className="text-sm leading-6 text-amber-900">
+                          <span className="font-medium">{topic.topic}</span>：{priorityAdvice(topic)}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </section>
       )}
 

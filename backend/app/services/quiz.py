@@ -3621,6 +3621,149 @@ def get_progress() -> dict:
     }
 
 
+def get_document_progress() -> dict:
+    """按答卷题目来源聚合文档掌握度；只读计算，不回写任何历史数据。"""
+    ensure_dirs()
+    docs = knowledge_service.list_documents()
+    docs_by_id = {
+        str(doc.get("doc_id")): doc
+        for doc in docs
+        if isinstance(doc, dict) and doc.get("doc_id")
+    }
+    docs_by_title = {
+        _title_key(str(doc.get("title") or "")): doc
+        for doc in docs_by_id.values()
+        if doc.get("title")
+    }
+    aggregate: dict[str, dict] = {
+        doc_id: {
+            "doc_id": doc_id,
+            "title": str(doc.get("title") or "未命名知识文档"),
+            "total": 0,
+            "correct": 0,
+            "attempt_ids": set(),
+            "topics": {},
+            "attribution_counts": {"exact": 0, "paper": 0, "title": 0},
+            "mistake_keys": set(),
+        }
+        for doc_id, doc in docs_by_id.items()
+    }
+    unattributed_total = 0
+
+    def paper_docs(paper: dict | None) -> list[dict]:
+        return _mistake_paper_docs(paper)
+
+    def resolve_question_doc(question: dict, paper: dict | None) -> tuple[dict | None, str]:
+        source_id = str(question.get("source_doc_id") or "").strip()
+        if source_id in docs_by_id:
+            return docs_by_id[source_id], "exact"
+        source_docs = question.get("source_docs") or []
+        for source in source_docs:
+            if isinstance(source, dict):
+                candidate = docs_by_id.get(str(source.get("doc_id") or ""))
+                if candidate:
+                    return candidate, "exact"
+        referenced = paper_docs(paper)
+        if len(referenced) == 1:
+            candidate = docs_by_id.get(str(referenced[0].get("doc_id") or ""))
+            if candidate:
+                return candidate, "paper"
+        source_title = _title_key(str(question.get("source_title") or ""))
+        if source_title and source_title in docs_by_title:
+            return docs_by_title[source_title], "title"
+        return None, ""
+
+    papers_by_id: dict[str, dict] = {}
+    papers_by_title: dict[str, dict] = {}
+    if PAPERS_DIR.exists():
+        for path in PAPERS_DIR.glob("*.json"):
+            paper = _read_json(path, None)
+            if isinstance(paper, dict) and paper.get("paper_id"):
+                papers_by_id[str(paper["paper_id"])] = paper
+            if isinstance(paper, dict) and paper.get("title"):
+                papers_by_title.setdefault(_title_key(str(paper["title"])), paper)
+
+    def resolve_paper(attempt_or_mistake: dict) -> dict | None:
+        paper = papers_by_id.get(str(attempt_or_mistake.get("paper_id") or ""))
+        if paper:
+            return paper
+        paper_title = str(attempt_or_mistake.get("paper_title") or "").strip()
+        if paper_title:
+            return papers_by_title.get(_title_key(paper_title))
+        return None
+
+    for path in ATTEMPTS_DIR.glob("*.json"):
+        attempt = _read_json(path, None)
+        if not isinstance(attempt, dict):
+            continue
+        attempt_id = str(attempt.get("attempt_id") or path.stem)
+        paper = resolve_paper(attempt)
+        for question in attempt.get("questions") or []:
+            if not isinstance(question, dict):
+                continue
+            doc, source_kind = resolve_question_doc(question, paper)
+            if not doc:
+                unattributed_total += 1
+                continue
+            item = aggregate[str(doc["doc_id"])]
+            item["total"] += 1
+            item["correct"] += 1 if question.get("is_correct") else 0
+            item["attempt_ids"].add(attempt_id)
+            item["attribution_counts"][source_kind] += 1
+            topic = str(question.get("topic") or "未分类").strip() or "未分类"
+            topic_stat = item["topics"].setdefault(topic, {"total": 0, "correct": 0, "streak": 0})
+            topic_stat["total"] += 1
+            topic_stat["correct"] += 1 if question.get("is_correct") else 0
+            topic_stat["streak"] = topic_stat["streak"] + 1 if question.get("is_correct") else 0
+
+    mistakes_by_doc: dict[str, set[str]] = {doc_id: set() for doc_id in aggregate}
+    for mistake in list_mistakes(limit=10_000):
+        if not isinstance(mistake, dict):
+            continue
+        paper = resolve_paper(mistake)
+        doc, _ = resolve_question_doc(mistake, paper)
+        if doc:
+            mistakes_by_doc[str(doc["doc_id"])].add(str(mistake.get("key") or mistake.get("stem") or ""))
+
+    result = []
+    for doc_id, item in aggregate.items():
+        total = item["total"]
+        if not total:
+            continue
+        topics = []
+        for topic, stat in item["topics"].items():
+            topics.append({
+                "topic": topic,
+                "total": stat["total"],
+                "correct": stat["correct"],
+                "accuracy": _accuracy(stat["correct"], stat["total"]),
+                "streak": stat["streak"],
+            })
+        topics.sort(key=lambda entry: (entry["accuracy"], -entry["total"], entry["topic"]))
+        result.append({
+            "doc_id": doc_id,
+            "title": item["title"],
+            "total": total,
+            "correct": item["correct"],
+            "accuracy": _accuracy(item["correct"], total),
+            "attempt_count": len(item["attempt_ids"]),
+            "active_mistake_count": len(mistakes_by_doc[doc_id]),
+            "weak_topics": [topic for topic in topics if topic["accuracy"] < 0.8][:8],
+            "topics": topics,
+            "attribution": item["attribution_counts"],
+        })
+    result.sort(key=lambda item: (item["accuracy"], -item["total"], item["title"]))
+    return {
+        "documents": result,
+        "no_data_docs": [
+            {"doc_id": doc_id, "title": doc.get("title") or "未命名知识文档"}
+            for doc_id, doc in docs_by_id.items()
+            if not aggregate[doc_id]["total"]
+        ],
+        "unattributed_total": unattributed_total,
+    }
+
+
 def list_attempts(limit: int = 20) -> list[dict]:
     ensure_dirs()
     items: list[dict] = []

@@ -109,6 +109,11 @@ async def get_progress():
     return quiz_service.get_progress()
 
 
+@router.get("/documents/progress")
+async def get_document_progress():
+    return await asyncio.to_thread(quiz_service.get_document_progress)
+
+
 @router.post("/submit")
 async def submit(req: QuizSubmitRequest):
     try:

@@ -13,6 +13,7 @@ import type {
   InterviewTurnResponse,
   MistakeItem,
   QuizAttempt,
+  QuizDocumentProgress,
   QuizGenerateRequest,
   QuizPaper,
   QuizProgress,
@@ -491,6 +492,10 @@ export async function deleteMistake(key: string): Promise<void> {
 
 export async function getQuizProgress(): Promise<QuizProgress> {
   return apiFetch<QuizProgress>('/quiz/progress')
+}
+
+export async function getQuizDocumentProgress(): Promise<QuizDocumentProgress> {
+  return apiFetch<QuizDocumentProgress>('/quiz/documents/progress')
 }
 
 export async function getReviewDashboard(): Promise<ReviewDashboard> {
