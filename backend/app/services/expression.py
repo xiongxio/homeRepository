@@ -1137,7 +1137,8 @@ def _generate_question_via_llm(
             ),
             max_tokens=1200,
             timeout=EXPRESSION_GENERATE_TIMEOUT_SECONDS,
-            max_attempts=1,
+            max_attempts=3,
+            retry_timeout=False,
         )
     except Exception as exc:
         message = str(exc).strip() or "模型调用失败。"

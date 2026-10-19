@@ -108,6 +108,7 @@ def _completion(
     max_tokens: int,
     json_mode: bool,
     max_attempts: int = _COMPLETION_MAX_ATTEMPTS,
+    retry_timeout: bool = True,
 ):
     kwargs = {
         "model": model,
@@ -140,6 +141,8 @@ def _completion(
             # 2) 上游瞬时错误：连接异常 / 5xx —— 退避后重试。
             #    401/403/402/422 等业务错误走不到这里，原样抛出让 chat_json 包装。
             if _is_transient_upstream_error(exc):
+                if isinstance(exc, APITimeoutError) and not retry_timeout:
+                    raise
                 if is_last:
                     raise
                 backoff = _COMPLETION_RETRY_BACKOFF * (attempt + 1)
@@ -223,6 +226,7 @@ def chat_json(
     model: str | None = None,
     timeout: float | None = None,
     max_attempts: int = _COMPLETION_MAX_ATTEMPTS,
+    retry_timeout: bool = True,
 ) -> dict:
     api_key, base_url, resolved_model = _provider_config(provider)
     provider_name = provider or settings.llm_provider
@@ -263,6 +267,7 @@ def chat_json(
                 max_tokens=max_tokens,
                 json_mode=True,
                 max_attempts=max_attempts,
+                retry_timeout=retry_timeout,
             )
         except Exception as exc:
             raise LlmError(_classify_upstream_error(exc) or f"调用 LLM 失败: {exc}") from exc
