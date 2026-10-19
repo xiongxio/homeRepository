@@ -9,11 +9,12 @@ import {
   Mic,
   Redo2,
   RefreshCw,
+  Search,
   Square,
   TrendingUp,
   XCircle,
 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   analyzeExpression,
   getExpressionProgress,
@@ -81,6 +82,49 @@ const QUESTION_TYPE_OPTIONS: Array<{
   { key: 'scenario', label: '场景推演', hint: '结合事实判断如何处理' },
   { key: 'contribution', label: '结果贡献', hint: '聚焦成果、影响和验证' },
 ]
+
+const REVIEW_RANGES: Array<{
+  key: 'all' | '1d' | '3d' | '7d' | '30d'
+  label: string
+  days: number
+}> = [
+  { key: 'all', label: '全部', days: 0 },
+  { key: '1d', label: '近1天', days: 1 },
+  { key: '3d', label: '近3天', days: 3 },
+  { key: '7d', label: '近1周', days: 7 },
+  { key: '30d', label: '近1月', days: 30 },
+]
+
+type ReviewRangeKey = (typeof REVIEW_RANGES)[number]['key']
+
+// 复盘记录的时间戳由后端以秒返回，统一转成毫秒后再比较和格式化。
+function toMilliseconds(value: number): number {
+  if (!value) return 0
+  return value < 1_000_000_000_000 ? value * 1000 : value
+}
+
+function reviewActivityAt(record: ReviewRecord): number {
+  return Math.max(
+    toMilliseconds(record.updated_at || 0),
+    toMilliseconds(record.last_review_at || 0),
+    toMilliseconds(record.created_at || 0),
+  )
+}
+
+function formatReviewAge(timestamp: number): string {
+  if (!timestamp) return ''
+  const now = new Date()
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const dayDiff = Math.floor((startOfToday - timestamp) / 86_400_000)
+  if (dayDiff <= 0) return '今天'
+  if (dayDiff === 1) return '昨天'
+  if (dayDiff < 31) return `${dayDiff} 天前`
+  const date = new Date(timestamp)
+  if (date.getFullYear() !== now.getFullYear()) {
+    return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`
+  }
+  return `${date.getMonth() + 1}/${date.getDate()}`
+}
 
 function formatClock(seconds: number): string {
   const minutes = Math.floor(seconds / 60)
@@ -265,6 +309,9 @@ export function ExpressionDrill({
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>(seedSourceDocIds)
   const [selectedReviewId, setSelectedReviewId] = useState(seedSourceRef)
   const [reviewRecords, setReviewRecords] = useState<ReviewRecord[]>([])
+  const [reviewSearch, setReviewSearch] = useState('')
+  const [reviewRange, setReviewRange] = useState<ReviewRangeKey>('all')
+  const [reviewPickerOpen, setReviewPickerOpen] = useState(!seedSourceRef)
   const [resumeRecord, setResumeRecord] = useState<ResumeRecord | null>(activeResume)
   const timerRef = useRef<number | null>(null)
   const seededTokenRef = useRef(seedToken)
@@ -282,6 +329,32 @@ export function ExpressionDrill({
   const shouldTranscribeRef = useRef(false)
   const answerRoundRef = useRef(0)
   const isRetrying = previousSessionId !== ''
+  const filteredReviewRecords = useMemo(() => {
+    const tokens = reviewSearch.trim().toLowerCase().split(/\s+/).filter(Boolean)
+    const range = REVIEW_RANGES.find((item) => item.key === reviewRange)
+    const cutoff =
+      range && range.days > 0 ? Date.now() - range.days * 86_400_000 : 0
+    return reviewRecords
+      .filter((record) => {
+        if (cutoff && reviewActivityAt(record) < cutoff) return false
+        if (tokens.length === 0) return true
+        const haystack = [
+          record.topic,
+          record.stem,
+          record.source_title ?? '',
+          ...(record.error_causes ?? []),
+          ...(record.options ?? []).map((option) => option.text),
+        ]
+          .join(' ')
+          .toLowerCase()
+        return tokens.every((token) => haystack.includes(token))
+      })
+      .sort((left, right) => reviewActivityAt(right) - reviewActivityAt(left))
+  }, [reviewRecords, reviewSearch, reviewRange])
+  const selectedReview = useMemo(
+    () => reviewRecords.find((record) => record.review_id === selectedReviewId) ?? null,
+    [reviewRecords, selectedReviewId],
+  )
   const [mediaSupported] = useState(
     () =>
       typeof navigator !== 'undefined' &&
@@ -371,7 +444,15 @@ export function ExpressionDrill({
       if (initial !== roleKey) {
         setRoleKey(initial)
       }
-      void loadQuestion(initial, seedTopic)
+      // 首次取题必须使用挂载时的题源，不能读 ref：
+      // 岗位接口返回前若用户切换了题源，ref 已变化，会带着空错题标识取题。
+      void loadQuestion(initial, seedTopic, {
+        docIds: seedSourceDocIds,
+        sourceTag: seedSourceTag,
+        sourceType: normalizeSourceType(seedSourceType),
+        sourceRef: seedSourceRef,
+        questionType: '',
+      })
     })
     void refreshProgress()
     // 只在首次挂载时加载岗位和题目；切换岗位由 chooseRole 显式触发，避免重复取题。
@@ -397,7 +478,10 @@ export function ExpressionDrill({
     setSourceType(normalizedSeedSource)
     setQuestionType('')
     if (normalizedSeedSource === 'knowledge') setSelectedDocIds(seedSourceDocIds)
-    if (normalizedSeedSource === 'mistake') setSelectedReviewId(seedSourceRef)
+    if (normalizedSeedSource === 'mistake') {
+      setSelectedReviewId(seedSourceRef)
+      setReviewPickerOpen(false)
+    }
     activeSourceRef.current = source
 
     if (normalizedSeedSource === 'knowledge' && seedSourceDocIds.length === 0) {
@@ -441,13 +525,8 @@ export function ExpressionDrill({
   const changeSourceType = (next: ExpressionSourceType) => {
     if (busy === 'record' || busy === 'transcribing' || busy === 'analyze') return
     setSourceType(next)
-    const nextReviewId =
-      next === 'mistake'
-        ? selectedReviewId || reviewRecords[0]?.review_id || ''
-        : selectedReviewId
-    if (next === 'mistake') {
-      setSelectedReviewId(nextReviewId)
-    }
+    const nextReviewId = selectedReviewId
+    if (next === 'mistake') setReviewPickerOpen(true)
     const source: ExpressionSourceContext = {
       docIds: selectedDocIds,
       sourceTag: '',
@@ -471,7 +550,11 @@ export function ExpressionDrill({
     if (next === 'mistake' && !nextReviewId) {
       activeSourceRef.current = source
       setQuestion(null)
-      setError('还没有可用的错题复盘记录。')
+      setError(
+        reviewRecords.length > 0
+          ? ''
+          : '还没有可用的错题复盘记录，先在「在线刷题」完成答卷并同步错题。',
+      )
       return
     }
     if (next === 'resume' && !resumeRecord) {
@@ -537,6 +620,7 @@ export function ExpressionDrill({
       setError('请选择一道错题。')
       return
     }
+    setReviewPickerOpen(false)
     reloadWithSource(source)
   }
 
@@ -902,27 +986,125 @@ export function ExpressionDrill({
 
           {sourceType === 'mistake' && (
             <div>
-              <label className="field-label" htmlFor="expression-review-source">
-                选择错题
-              </label>
-              <select
-                id="expression-review-source"
-                className="text-input disabled:cursor-not-allowed disabled:bg-zinc-50 disabled:text-zinc-400"
-                value={selectedReviewId}
-                onChange={(event) => changeReviewRecord(event.target.value)}
-                disabled={reviewRecords.length === 0 || Boolean(busy)}
-              >
-                <option value="">未选择</option>
-                {reviewRecords.map((record) => (
-                  <option key={record.review_id} value={record.review_id}>
-                    {record.topic} · {record.stem.slice(0, 40)}
-                  </option>
-                ))}
-              </select>
-              {reviewRecords.length === 0 && (
+              <div className="flex items-center justify-between gap-3">
+                <span className="field-label">选择错题</span>
+                {selectedReview && (
+                  <button
+                    type="button"
+                    className="text-xs font-semibold text-emerald-700 underline underline-offset-2"
+                    onClick={() => setReviewPickerOpen((open) => !open)}
+                    disabled={Boolean(busy)}
+                  >
+                    {reviewPickerOpen ? '收起列表' : '更换错题'}
+                  </button>
+                )}
+              </div>
+
+              {selectedReview ? (
+                <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50/70 px-3 py-2.5">
+                  <p className="truncate text-xs font-semibold text-emerald-800">
+                    {selectedReview.topic}
+                  </p>
+                  <p className="mt-1 line-clamp-2 text-sm leading-6 text-zinc-800">
+                    {selectedReview.stem}
+                  </p>
+                  <p className="mt-1 text-xs text-zinc-500">
+                    错 {selectedReview.wrong_count} 次 ·{' '}
+                    {formatReviewAge(reviewActivityAt(selectedReview))}
+                  </p>
+                </div>
+              ) : (
                 <p className="mt-1.5 text-xs leading-5 text-zinc-500">
-                  还没有错题复盘记录，先在「在线刷题」完成答卷并同步错题。
+                  {reviewRecords.length > 0
+                    ? '在下面的列表里搜索并选择一道错题，只会围绕这一道题展开。'
+                    : '还没有错题复盘记录，先在「在线刷题」完成答卷并同步错题。'}
                 </p>
+              )}
+
+              {reviewPickerOpen && reviewRecords.length > 0 && (
+                <div className="mt-2 rounded-lg border border-zinc-200 bg-white p-2.5">
+                  <div className="relative">
+                    <Search
+                      className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-zinc-400"
+                      aria-hidden="true"
+                    />
+                    <input
+                      type="search"
+                      className="text-input pl-9"
+                      value={reviewSearch}
+                      onChange={(event) => setReviewSearch(event.target.value)}
+                      placeholder="搜索知识点、题干、选项或来源文档"
+                      aria-label="搜索错题"
+                      disabled={Boolean(busy)}
+                    />
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {REVIEW_RANGES.map((range) => {
+                      const active = reviewRange === range.key
+                      return (
+                        <button
+                          key={range.key}
+                          type="button"
+                          className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                            active
+                              ? 'border-emerald-500 bg-emerald-50 text-emerald-800'
+                              : 'border-zinc-200 bg-white text-zinc-600 hover:border-zinc-300'
+                          }`}
+                          onClick={() => setReviewRange(range.key)}
+                          aria-pressed={active}
+                          disabled={Boolean(busy)}
+                        >
+                          {range.label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <p className="mt-2 text-xs text-zinc-500">
+                    共 {reviewRecords.length} 道，当前匹配 {filteredReviewRecords.length} 道
+                  </p>
+                  <div className="mt-1.5 max-h-64 space-y-1 overflow-y-auto">
+                    {filteredReviewRecords.length === 0 ? (
+                      <p className="rounded-md bg-zinc-50 px-3 py-4 text-center text-xs leading-5 text-zinc-500">
+                        没有匹配的错题，试试放宽时间范围或换个关键词。
+                      </p>
+                    ) : (
+                      filteredReviewRecords.map((record) => {
+                        const active = record.review_id === selectedReviewId
+                        return (
+                          <button
+                            key={record.review_id}
+                            type="button"
+                            className={`flex w-full items-start gap-2 rounded-md border px-2.5 py-2 text-left transition ${
+                              active
+                                ? 'border-emerald-400 bg-emerald-50'
+                                : 'border-transparent hover:border-zinc-200 hover:bg-zinc-50'
+                            }`}
+                            onClick={() => changeReviewRecord(record.review_id)}
+                            aria-pressed={active}
+                            disabled={Boolean(busy)}
+                          >
+                            <span className="min-w-0 flex-1">
+                              <span className="flex items-center gap-2">
+                                <span className="truncate text-xs font-medium text-zinc-500">
+                                  {record.topic}
+                                </span>
+                                <span className="shrink-0 text-[11px] text-zinc-400">
+                                  错 {record.wrong_count} 次
+                                </span>
+                              </span>
+                              <span className="mt-0.5 line-clamp-2 block text-sm leading-5 text-zinc-800">
+                                {record.stem}
+                              </span>
+                            </span>
+                            <span className="mt-0.5 shrink-0 text-[11px] text-zinc-400">
+                              {formatReviewAge(reviewActivityAt(record))}
+                            </span>
+                          </button>
+                        )
+                      })
+                    )}
+                  </div>
+                </div>
               )}
             </div>
           )}
