@@ -44,6 +44,7 @@ GENERATED_QUESTION_TTL_SECONDS = 7 * 24 * 3600
 EXPRESSION_GENERATE_FAST_WAIT_SECONDS = 6.0
 EXPRESSION_MISTAKE_FAST_WAIT_SECONDS = 6.0
 EXPRESSION_MISTAKE_MAX_RECORDS = 12
+MISTAKE_REWRITE_VERSION = "spoken-v2"
 _SPEAKING_JOBS_LOCK = threading.Lock()
 _SPEAKING_JOBS: set[str] = set()
 _SPEAKING_WORK_LIMIT = threading.Semaphore(2)
@@ -820,7 +821,7 @@ def _mistake_expression_question(record: dict, source: str, role) -> dict:
     cache_key = _generated_question_cache_key(
         role.key,
         topic,
-        [topic_id or fingerprint, fingerprint],
+        [topic_id or fingerprint, fingerprint, MISTAKE_REWRITE_VERSION],
         "",
         "mistake",
     )
