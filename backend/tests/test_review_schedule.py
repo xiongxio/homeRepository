@@ -484,6 +484,56 @@ class ReviewScheduleTests(unittest.TestCase):
         self.assertNotIn("无关", answer)
         self.assertLessEqual(len(answer), 260)
 
+    def test_mistake_fallback_merges_group_into_one_paragraph(self):
+        single = self._question(
+            topic="Agent = LLM + Harness",
+            stem="Harness 的角色是什么？",
+            correct="B",
+        )
+        single.update(
+            {
+                "options": [
+                    {"key": "A", "text": "LLM 本身"},
+                    {
+                        "key": "B",
+                        "text": "让 LLM 以某种组织形式干活的“身体 + 工作制度”",
+                    },
+                ],
+                "explanation": (
+                    "资料把 Agent 拆成 LLM 和 Harness 两个角色："
+                    "LLM 是大脑，Harness 是让大脑干活的组织形式。"
+                    "B 项正确。A 项混淆了两个角色。"
+                ),
+            }
+        )
+        judge = {
+            "topic": "Agent = LLM + Harness",
+            "type": "judge",
+            "stem": "Harness 决定聪明大脑以什么组织形式干活。",
+            "options": [
+                {"key": "A", "text": "正确"},
+                {"key": "B", "text": "错误"},
+            ],
+            "correct_answer": ["A"],
+            "correct_answer_text": "A. 正确",
+            "explanation": (
+                "资料明确给出公式 Agent = LLM + Harness："
+                "LLM 是大脑，Harness 是让大脑干活的组织形式。"
+                "同一个聪明模型放在不同 Harness 下产出可能完全不同。"
+                "因此该说法正确。"
+            ),
+            "source_title": "ClaudeCode原理解析",
+        }
+
+        answer = expression_service._mistake_spoken_reference([single, judge])
+
+        self.assertEqual(1, answer.count("简单说"))
+        self.assertEqual(1, len([line for line in answer.splitlines() if line.strip()]))
+        self.assertIn("身体 + 工作制度", answer)
+        self.assertNotIn("简单说，正确", answer)
+        self.assertNotIn("B 项正确", answer)
+        self.assertLessEqual(len(answer), 260)
+
     def test_expression_question_rejects_missing_wrong_review_record(self):
         with self.assertRaisesRegex(
             expression_service.ExpressionError,

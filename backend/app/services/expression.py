@@ -617,6 +617,9 @@ def _looks_like_choice_question(question: str) -> bool:
 
 def _mistake_answer_text(record: dict) -> str:
     """把正确选项还原成可朗读的文本，避免输出 A/B/C/D。"""
+    # 判断题的“正确/错误”不是可口述的结论，交给解析补充具体内容。
+    if str(record.get("type") or "").strip().lower() == "judge":
+        return ""
     answer_keys = {
         str(item).strip().upper()
         for item in (record.get("correct_answer") or [])
@@ -675,31 +678,29 @@ def _humanize_mistake_answer(text: str, max_sentences: int = 2) -> str:
 
 
 def _mistake_spoken_reference(records: list[dict]) -> str:
-    """不用 LLM 时，用正确选项和清洗后的解析拼一段简洁口语答案。"""
-    parts: list[str] = []
-    seen: set[str] = set()
+    """不用 LLM 时，从同知识点错题里挑信息量最大的一条，生成单段口语答案。"""
+    candidates: list[tuple[int, str, str]] = []
     for record in records:
         explanation = _humanize_mistake_answer(
             str(record.get("explanation") or ""),
-            max_sentences=2,
+            max_sentences=3,
         )
         answer = _mistake_answer_text(record)
-        if explanation and answer and answer not in explanation:
-            sentence = f"简单说，{answer}。{explanation}"
-        elif explanation:
-            sentence = explanation
-        elif answer:
-            sentence = f"简单说，{answer}。"
-        else:
-            sentence = ""
-        normalized = _keyword_norm(sentence)
-        if not sentence or normalized in seen:
+        if not answer and not explanation:
             continue
-        seen.add(normalized)
-        parts.append(sentence)
-        if len(parts) >= 2:
-            break
-    return "\n".join(parts)[:260].rstrip()
+        # 有实质结论的单选/多选题优先；判断题只靠解析参与候选。
+        score = (1000 if answer else 0) + len(answer) + min(len(explanation), 400)
+        candidates.append((score, answer, explanation))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, answer, explanation = candidates[0]
+    parts: list[str] = []
+    if answer:
+        parts.append(f"简单说，{answer}。")
+    if explanation:
+        parts.append(explanation)
+    return "".join(parts)[:260].rstrip()
 
 
 def _mistake_open_question(topic: str) -> str:
