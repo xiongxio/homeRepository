@@ -391,7 +391,7 @@ export default function App() {
             {view === 'practice' && (
               <button type="button" className="secondary-btn h-10 px-3 text-sm font-medium" onClick={restart}>
                 <RotateCcw className="size-4" aria-hidden="true" />
-                重新开始
+                重置
               </button>
             )}
             <button
