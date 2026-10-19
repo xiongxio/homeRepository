@@ -458,7 +458,10 @@ def _first_chunks_for_documents(doc_ids: list[str] | None, limit: int = 6) -> li
             continue
         title = str(summary.get("title") or document.get("title") or "").strip()
         for chunk in document.get("chunks") or []:
-            text = str(chunk.get("text") or "").strip()
+            if isinstance(chunk, dict):
+                text = str(chunk.get("text") or "").strip()
+            else:
+                text = str(chunk or "").strip()
             if not text:
                 continue
             chunks.append({

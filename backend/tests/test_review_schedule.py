@@ -796,6 +796,26 @@ class ReviewScheduleTests(unittest.TestCase):
         self.assertIn("【已生成题目】", prompt)
         self.assertIn("旧问题", prompt)
 
+    def test_first_chunks_for_documents_accepts_string_chunks(self):
+        with (
+            patch(
+                "backend.app.services.knowledge.list_documents",
+                return_value=[{"doc_id": "doc_x", "title": "测试文档"}],
+            ),
+            patch(
+                "backend.app.services.knowledge.load_document",
+                return_value={
+                    "title": "测试文档",
+                    "chunks": ["字符串片段一", "字符串片段二"],
+                },
+            ),
+        ):
+            chunks = expression_service._first_chunks_for_documents(["doc_x"])
+
+        self.assertEqual(2, len(chunks))
+        self.assertEqual("字符串片段一", chunks[0]["text"])
+        self.assertEqual("测试文档", chunks[0]["title"])
+
     def test_slow_generation_returns_close_question_quickly(self):
         expression_dir = self.data_dir / "expression"
         question_item = {
