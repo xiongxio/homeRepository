@@ -133,6 +133,7 @@ export default function App() {
   const [llmConfig, setLlmConfig] = useState<LlmConfig | null>(null)
   const [reviewDashboard, setReviewDashboard] = useState<ReviewDashboard | null>(null)
   const [modelSettingsOpen, setModelSettingsOpen] = useState(false)
+  const [toast, setToast] = useState<{ id: number; message: string } | null>(null)
   const [expressionSeed, setExpressionSeed] = useState<{
     topic: string
     roleKey?: string
@@ -181,6 +182,14 @@ export default function App() {
   useEffect(() => {
     void refreshQuizState()
   }, [refreshQuizState])
+
+  useEffect(() => {
+    if (!toast) return
+    const timer = window.setTimeout(() => {
+      setToast((current) => (current?.id === toast.id ? null : current))
+    }, 2500)
+    return () => window.clearTimeout(timer)
+  }, [toast])
 
   const handlePaperReady = useCallback((next: QuizPaper) => {
     setPaper(next)
@@ -311,6 +320,10 @@ export default function App() {
     setTranscript('')
     setReport(null)
     setError('')
+    setToast({
+      id: Date.now(),
+      message: '当前练习已重置，可重新上传或开始分析。',
+    })
   }
 
   const activeStep =
@@ -728,6 +741,16 @@ export default function App() {
           <ReportView report={report} onRestart={restart} />
         )}
       </main>
+
+      {toast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-lg bg-zinc-900 px-4 py-2.5 text-sm font-medium text-white shadow-lg"
+        >
+          {toast.message}
+        </div>
+      )}
 
       <footer className="border-t border-zinc-200 bg-white py-4">
         <p className="mx-auto flex max-w-6xl items-center justify-center gap-2 px-4 text-center text-xs text-zinc-500">
