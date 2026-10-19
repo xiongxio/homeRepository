@@ -167,6 +167,11 @@ export async function createTranscriptionJob(
   })
 }
 
+/** 终止后端转写任务（会杀掉本地 Whisper 推理进程）。 */
+export async function cancelTranscriptionJob(jobId: string): Promise<void> {
+  await apiFetch<JobState>(`/jobs/${jobId}/cancel`, { method: 'POST' })
+}
+
 export function pollJob(
   jobId: string,
   onUpdate: (job: JobState) => void,
@@ -215,6 +220,10 @@ export function pollJob(
         }
         if (job.status === 'error') {
           finish(() => reject(new Error(job.error || '转写任务失败')))
+          return
+        }
+        if (job.status === 'cancelled') {
+          finish(() => resolve(job))
           return
         }
         timer = setTimeout(() => {

@@ -1,10 +1,21 @@
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 
 
 class AudioError(RuntimeError):
     pass
+
+
+async def _terminate(proc: asyncio.subprocess.Process) -> None:
+    """取消任务时连带终止 ffmpeg/ffprobe，否则它们会继续跑到结束。"""
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError, OSError):
+        proc.kill()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await proc.wait()
 
 
 async def _run(cmd: list[str]) -> str:
@@ -16,7 +27,11 @@ async def _run(cmd: list[str]) -> str:
         )
     except FileNotFoundError as exc:
         raise AudioError("未找到 ffmpeg 或 ffprobe，请安装后确保其在 PATH 中。") from exc
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await proc.communicate()
+    except asyncio.CancelledError:
+        await _terminate(proc)
+        raise
     if proc.returncode != 0:
         tail = stderr.decode(errors="replace")[-800:]
         raise AudioError(f"命令执行失败: {' '.join(cmd[:2])} ...\n{tail}")

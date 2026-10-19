@@ -18,6 +18,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   analyze,
+  cancelTranscriptionJob,
   createTranscriptionJob,
   getActiveResume,
   getLlmConfig,
@@ -148,6 +149,7 @@ export default function App() {
   const transcriptionRequestRef = useRef<{
     id: number
     controller: AbortController
+    jobId?: string
   } | null>(null)
 
   useEffect(() => {
@@ -199,24 +201,33 @@ export default function App() {
     return () => window.clearTimeout(timer)
   }, [toast])
 
-  useEffect(() => {
-    return () => {
-      analysisRequestRef.current?.controller.abort()
-      transcriptionRequestRef.current?.controller.abort()
+  // 前端 abort 只停轮询，必须同时让后端终止推理进程，否则本地 Whisper 会一直跑。
+  const stopTranscriptionJob = useCallback(() => {
+    const current = transcriptionRequestRef.current
+    transcriptionRequestRef.current = null
+    current?.controller.abort()
+    if (current?.jobId) {
+      void cancelTranscriptionJob(current.jobId).catch(() => undefined)
     }
   }, [])
 
+  useEffect(() => {
+    return () => {
+      analysisRequestRef.current?.controller.abort()
+      stopTranscriptionJob()
+    }
+  }, [stopTranscriptionJob])
+
   const cancelTranscription = useCallback(() => {
-    transcriptionRequestRef.current?.controller.abort()
-    transcriptionRequestRef.current = null
+    stopTranscriptionJob()
     setJob(null)
     setTranscript('')
     setError('')
     setToast({
       id: Date.now(),
-      message: '已停止等待本次转写，可重新上传或改用粘贴转写。',
+      message: '已取消本次转写，可重新上传或改用粘贴转写。',
     })
-  }, [])
+  }, [stopTranscriptionJob])
 
   const cancelAnalysis = useCallback(() => {
     analysisRequestRef.current?.controller.abort()
@@ -275,7 +286,7 @@ export default function App() {
 
   const handleUploaded = useCallback(async (fileId: string, file: File) => {
     const requestId = ++requestIdRef.current
-    transcriptionRequestRef.current?.controller.abort()
+    stopTranscriptionJob()
     const controller = new AbortController()
     transcriptionRequestRef.current = { id: requestId, controller }
     const isCurrent = () => transcriptionRequestRef.current?.id === requestId
@@ -286,7 +297,14 @@ export default function App() {
     setError('')
     try {
       const created = await createTranscriptionJob(fileId, controller.signal)
-      if (!isCurrent()) return
+      if (!isCurrent()) {
+        // 请求返回前用户已经取消，把后端刚建出来的任务也一起收掉。
+        void cancelTranscriptionJob(created.job_id).catch(() => undefined)
+        return
+      }
+      if (transcriptionRequestRef.current) {
+        transcriptionRequestRef.current.jobId = created.job_id
+      }
       setJob({
         job_id: created.job_id,
         file_id: fileId,
@@ -312,7 +330,7 @@ export default function App() {
     } finally {
       if (isCurrent()) transcriptionRequestRef.current = null
     }
-  }, [])
+  }, [stopTranscriptionJob])
 
   const isTranscribing = job?.status === 'queued' || job?.status === 'running'
   const canAnalyze = Boolean(transcript.trim()) && !isTranscribing && phase === 'input'
@@ -391,8 +409,7 @@ export default function App() {
   const restart = () => {
     analysisRequestRef.current?.controller.abort()
     analysisRequestRef.current = null
-    transcriptionRequestRef.current?.controller.abort()
-    transcriptionRequestRef.current = null
+    stopTranscriptionJob()
     setPhase('input')
     setInputMode('upload')
     setUploadedFile(null)
@@ -409,6 +426,7 @@ export default function App() {
   const activeStep =
     phase === 'report' ? 3 : phase === 'analyzing' ? 2 : isTranscribing ? 1 : 0
   const jobProgress = job?.progress ? Math.round(job.progress * 100) : 0
+  const jobFailed = job?.status === 'error' || job?.status === 'cancelled'
   const canResetPractice =
     view === 'practice' &&
     phase === 'input' &&
@@ -715,9 +733,9 @@ export default function App() {
                   <div className="mt-3 h-2 overflow-hidden rounded-full bg-zinc-200">
                     <div
                       className={`h-full rounded-full ${
-                        job.status === 'error' ? 'bg-red-500' : 'bg-emerald-600'
+                        jobFailed ? 'bg-red-500' : 'bg-emerald-600'
                       }`}
-                      style={{ width: `${job.status === 'error' ? 100 : jobProgress}%` }}
+                      style={{ width: `${jobFailed ? 100 : jobProgress}%` }}
                     />
                   </div>
                   {job.result && (

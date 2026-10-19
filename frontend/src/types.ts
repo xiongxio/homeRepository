@@ -25,7 +25,7 @@ export interface TranscriptResult {
   segment_count: number
 }
 
-export type JobStatus = 'queued' | 'running' | 'done' | 'error'
+export type JobStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled'
 
 export interface JobState {
   job_id: string
