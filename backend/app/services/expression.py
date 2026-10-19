@@ -1212,6 +1212,40 @@ def _knowledge_pending_response(
     }
 
 
+def _resume_pending_response(
+    role,
+    source: str,
+    source_ref: str,
+    question_type: str,
+    nonce: str,
+    source_title: str,
+) -> dict:
+    """简历题目仍在后台生成时返回的占位响应，前端按原参数轮询。"""
+    return {
+        "question": "",
+        "label": "",
+        "source": source_title,
+        "section": "",
+        "topic_matched": False,
+        "generated_by_llm": False,
+        "generation_pending": True,
+        "pending_token": nonce,
+        "retry_after_ms": 1500,
+        "disclaimer": "正在从当前简历生成表达题，完成后会自动显示。",
+        "reference_answer": "",
+        "keywords": [],
+        "standard_key_points": [],
+        "reference_script": "",
+        "source_tag": source or "resume",
+        "source_type": "resume",
+        "source_ref": source_ref,
+        "question_type": question_type,
+        "source_title": source_title,
+        "role_key": role.key,
+        "role_name": role.name,
+    }
+
+
 def drill_question(
     role_key: str,
     topic_hint: str = "",
@@ -1469,8 +1503,18 @@ def drill_question(
             if generated_payload:
                 _save_generated_question(cache_key, generated_payload)
         if not generated_payload:
+            if _is_generation_pending(cache_key):
+                return _resume_pending_response(
+                    role,
+                    source,
+                    generated_source_ref,
+                    question_type,
+                    nonce,
+                    resume_title,
+                )
+            failure = _generation_failure(cache_key)
             raise ExpressionError(
-                "暂时无法从当前简历生成表达题，请稍后重试。"
+                failure or "暂时无法从当前简历生成表达题，请稍后重试。"
             )
 
         _prefetch_speaking_materials(

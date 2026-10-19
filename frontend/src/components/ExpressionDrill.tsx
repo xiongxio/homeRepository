@@ -376,6 +376,7 @@ export function ExpressionDrill({
   const [knowledgePool, setKnowledgePool] =
     useState<KnowledgePoolState>(EMPTY_KNOWLEDGE_POOL)
   const [knowledgeGenerating, setKnowledgeGenerating] = useState(false)
+  const [resumeGenerating, setResumeGenerating] = useState(false)
   const [resumeRecord, setResumeRecord] = useState<ResumeRecord | null>(activeResume)
   const timerRef = useRef<number | null>(null)
   const seededTokenRef = useRef(seedToken)
@@ -394,6 +395,7 @@ export function ExpressionDrill({
   const answerRoundRef = useRef(0)
   const mistakeRefreshTimeoutRef = useRef<number | null>(null)
   const knowledgeRefreshTimeoutRef = useRef<number | null>(null)
+  const resumeRefreshTimeoutRef = useRef<number | null>(null)
   const isRetrying = previousSessionId !== ''
   const reviewGroups = useMemo(() => buildReviewGroups(reviewRecords), [reviewRecords])
   const filteredReviewGroups = useMemo(() => {
@@ -589,6 +591,61 @@ export function ExpressionDrill({
     [],
   )
 
+  const scheduleResumeRefresh = useCallback(
+    (
+      key: string,
+      hint: string,
+      source: ExpressionSourceContext,
+      round: number,
+      deadline: number,
+    ) => {
+      if (source.sourceType !== 'resume') return
+      if (Date.now() > deadline) {
+        setResumeGenerating(false)
+        setBusy('')
+        setError('生成表达题超时，请稍后重试。')
+        return
+      }
+      if (resumeRefreshTimeoutRef.current) {
+        window.clearTimeout(resumeRefreshTimeoutRef.current)
+      }
+      resumeRefreshTimeoutRef.current = window.setTimeout(async () => {
+        resumeRefreshTimeoutRef.current = null
+        if (answerRoundRef.current !== round) return
+        try {
+          const refreshed = await getExpressionQuestion(
+            key,
+            hint,
+            source.docIds,
+            source.sourceTag,
+            source.sourceType,
+            source.sourceRef,
+            source.questionType,
+          )
+          if (answerRoundRef.current !== round) return
+          if (refreshed.generation_pending) {
+            scheduleResumeRefresh(key, hint, source, round, deadline)
+            return
+          }
+          setQuestion(refreshed)
+          setResumeGenerating(false)
+          setBusy('')
+          setError('')
+        } catch (refreshError) {
+          if (answerRoundRef.current !== round) return
+          setResumeGenerating(false)
+          setBusy('')
+          setError(
+            refreshError instanceof Error
+              ? refreshError.message
+              : '生成表达题失败，请稍后重试。',
+          )
+        }
+      }, 1500)
+    },
+    [],
+  )
+
   const loadQuestion = useCallback(
     async (
       key: string,
@@ -606,16 +663,22 @@ export function ExpressionDrill({
         window.clearTimeout(knowledgeRefreshTimeoutRef.current)
         knowledgeRefreshTimeoutRef.current = null
       }
+      if (resumeRefreshTimeoutRef.current) {
+        window.clearTimeout(resumeRefreshTimeoutRef.current)
+        resumeRefreshTimeoutRef.current = null
+      }
       setKnowledgeGenerating(false)
+      setResumeGenerating(false)
       cancelActiveRecording()
       const round = answerRoundRef.current
       setBusy('question')
       setError('')
+      setQuestion(null)
       setSession(null)
       setTranscript('')
       setPreviousSessionId('')
       setRetryMissedPoints([])
-      let pendingKnowledge = false
+      let pendingQuestion = false
       try {
         setTopicHint(hint)
         activeSourceRef.current = activeSource
@@ -633,7 +696,7 @@ export function ExpressionDrill({
           activeSource.sourceType === 'knowledge' &&
           nextQuestion.generation_pending
         ) {
-          pendingKnowledge = true
+          pendingQuestion = true
           setQuestion(null)
           setKnowledgeGenerating(true)
           setError('')
@@ -648,8 +711,27 @@ export function ExpressionDrill({
           )
           return
         }
+        if (
+          activeSource.sourceType === 'resume' &&
+          nextQuestion.generation_pending
+        ) {
+          pendingQuestion = true
+          setQuestion(null)
+          setResumeGenerating(true)
+          setError('')
+          setBusy('question')
+          scheduleResumeRefresh(
+            key,
+            hint,
+            activeSource,
+            round,
+            Date.now() + 180_000,
+          )
+          return
+        }
         setQuestion(nextQuestion)
         setKnowledgeGenerating(false)
+        setResumeGenerating(false)
         if (activeSource.sourceType === 'knowledge') {
           setKnowledgePool({
             questions: nextQuestion.pool_questions ?? [],
@@ -668,12 +750,18 @@ export function ExpressionDrill({
         }
       } catch (loadError) {
         setKnowledgeGenerating(false)
+        setResumeGenerating(false)
         setError(loadError instanceof Error ? loadError.message : '取题失败。')
       } finally {
-        if (!pendingKnowledge) setBusy('')
+        if (!pendingQuestion) setBusy('')
       }
     },
-    [cancelActiveRecording, scheduleKnowledgeRefresh, scheduleMistakeRefresh],
+    [
+      cancelActiveRecording,
+      scheduleKnowledgeRefresh,
+      scheduleMistakeRefresh,
+      scheduleResumeRefresh,
+    ],
   )
 
   useEffect(
@@ -683,6 +771,9 @@ export function ExpressionDrill({
       }
       if (knowledgeRefreshTimeoutRef.current) {
         window.clearTimeout(knowledgeRefreshTimeoutRef.current)
+      }
+      if (resumeRefreshTimeoutRef.current) {
+        window.clearTimeout(resumeRefreshTimeoutRef.current)
       }
     },
     [],
@@ -1613,15 +1704,23 @@ export function ExpressionDrill({
                   ? knowledgeGenerating
                     ? '正在生成表达题'
                     : '勾选文档后点「生成 1 道表达题」开始'
-                  : '选好岗位后取一道真题开始'}
+                  : sourceType === 'resume'
+                    ? resumeGenerating
+                      ? '正在生成表达题'
+                      : '点击右侧按钮，从当前简历生成一道表达题'
+                    : '选好岗位后取一道真题开始'}
             </p>
             <p className="mt-1.5 text-[15px] font-medium leading-7 text-zinc-900">
               {question?.question ??
                 (knowledgeGenerating
                   ? '正在从所选文档生成表达题，完成后会自动显示，不需要重复点击。'
-                  : sourceType === 'knowledge'
-                    ? '先在上方勾选知识库文档，再点「生成 1 道表达题」。'
-                    : '点击右侧按钮，从你的真实面试题库里抽一道表达练习题。')}
+                  : resumeGenerating
+                    ? '正在从当前简历生成表达题，完成后会自动显示，不需要重复点击。'
+                    : sourceType === 'knowledge'
+                      ? '先在上方勾选知识库文档，再点「生成 1 道表达题」。'
+                      : sourceType === 'resume'
+                        ? '点击右侧按钮，基于当前简历的项目、技能和亮点生成一道表达题。'
+                        : '点击右侧按钮，从你的真实面试题库里抽一道表达练习题。')}
             </p>
             {question?.source && (
               <p className="mt-1 text-xs leading-5 text-zinc-500">
@@ -1699,7 +1798,9 @@ export function ExpressionDrill({
               knowledgePoolAtEnd &&
               knowledgePool.exhausted
                 ? '本组已练完'
-                : '换一题'}
+                : question
+                  ? '换一题'
+                  : '生成一题'}
             </button>
           )}
         </div>
@@ -1712,6 +1813,19 @@ export function ExpressionDrill({
             />
             <span>
               正在从所选文档生成表达题。当前模型较慢时可能需要 1–2
+              分钟，页面会自动等待，不需要重复点击。
+            </span>
+          </div>
+        )}
+
+        {resumeGenerating && sourceType === 'resume' && (
+          <div className="mt-3 flex items-start gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-800">
+            <Loader2
+              className="mt-0.5 size-3.5 shrink-0 animate-spin"
+              aria-hidden="true"
+            />
+            <span>
+              正在从当前简历生成表达题。当前模型较慢时可能需要 1–2
               分钟，页面会自动等待，不需要重复点击。
             </span>
           </div>
