@@ -167,6 +167,18 @@ def is_feishu_doc_url(url: str) -> bool:
     return bool(re.search(r"https://[^/]*(feishu\.cn|larksuite\.com|larkoffice\.com)/(docx|docs|wiki)/", url))
 
 
+def _document_is_complete(
+    missing: list[str],
+    saw_final_page: bool,
+    pages: int,
+    inline_has_more: bool | None,
+) -> bool:
+    """短文档随首屏 HTML 一次性下发，不触发分页接口，按首屏 has_more=false 判定完整。"""
+    return not missing and (
+        saw_final_page or (pages == 0 and inline_has_more is False)
+    )
+
+
 def fetch_document(url: str, timeout_ms: int = 90_000, settle_ms: int = 2_500) -> FeishuDocument:
     """用无头浏览器加载飞书文档，截获全部分页响应后合并正文。"""
     try:
@@ -275,7 +287,12 @@ def fetch_document(url: str, timeout_ms: int = 90_000, settle_ms: int = 2_500) -
                         .sort((a, b) => Number(a) - Number(b))
                         .map(key => raw[key] || '')
                         .join('');
-                      return { rootId, title, children: map[rootId]?.data?.children || [] };
+                      return {
+                        rootId,
+                        title,
+                        children: map[rootId]?.data?.children || [],
+                        hasMore: data?.has_more ?? null,
+                      };
                     }"""
                 )
             except Exception:
@@ -341,14 +358,18 @@ def fetch_document(url: str, timeout_ms: int = 90_000, settle_ms: int = 2_500) -
 
     text = render_blocks(block_map, sequence)
     missing = [bid for bid in sequence if bid not in block_map]
-    complete = saw_final_page and not missing
+    # 短文档会随首屏 HTML 一次性下发并带 has_more=false，不会触发分页接口。
+    # 这种情况下只要没有缺失块，就应视为完整，否则会被误判为不完整而拒绝入库。
+    inline_has_more = snapshot.get("hasMore") if isinstance(snapshot, dict) else None
+    complete = _document_is_complete(missing, saw_final_page, pages, inline_has_more)
     reason = ""
     if not complete:
-        reason = (
-            f"仅取到 {len(sequence) - len(missing)} / {len(sequence)} 个内容块"
-            if missing
-            else "未收到分页结束标记，正文可能不完整"
-        )
+        if missing:
+            reason = f"仅取到 {len(sequence) - len(missing)} / {len(sequence)} 个内容块"
+        elif pages == 0 and inline_has_more is not False:
+            reason = "首屏未标记完整且未收到分页结束标记，正文可能不完整"
+        else:
+            reason = "未收到分页结束标记，正文可能不完整"
 
     if not title and text:
         title = text.splitlines()[0].lstrip("# ").strip()
