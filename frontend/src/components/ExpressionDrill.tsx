@@ -84,7 +84,7 @@ const QUESTION_TYPE_OPTIONS: Array<{
 ]
 
 const REVIEW_RANGES: Array<{
-  key: 'all' | '1d' | '3d' | '7d' | '30d'
+  key: 'all' | '1d' | '3d' | '7d' | '14d' | '30d'
   label: string
   days: number
 }> = [
@@ -92,6 +92,7 @@ const REVIEW_RANGES: Array<{
   { key: '1d', label: '近1天', days: 1 },
   { key: '3d', label: '近3天', days: 3 },
   { key: '7d', label: '近1周', days: 7 },
+  { key: '14d', label: '近2周', days: 14 },
   { key: '30d', label: '近1月', days: 30 },
 ]
 
