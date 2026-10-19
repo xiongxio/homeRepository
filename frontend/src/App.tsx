@@ -329,6 +329,11 @@ export default function App() {
   const activeStep =
     phase === 'report' ? 3 : phase === 'analyzing' ? 2 : isTranscribing ? 1 : 0
   const jobProgress = job?.progress ? Math.round(job.progress * 100) : 0
+  const canResetPractice =
+    view === 'practice' &&
+    phase === 'input' &&
+    !isTranscribing &&
+    Boolean(uploadedFile || job || transcript.trim() || error)
 
   return (
     <div className="min-h-screen bg-zinc-100">
@@ -401,7 +406,7 @@ export default function App() {
                 表达训练
               </button>
             </div>
-            {view === 'practice' && (
+            {canResetPractice && (
               <button type="button" className="secondary-btn h-10 px-3 text-sm font-medium" onClick={restart}>
                 <RotateCcw className="size-4" aria-hidden="true" />
                 重置
