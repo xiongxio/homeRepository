@@ -615,7 +615,9 @@ def _collect_material(
 ) -> tuple[str, list[str], list[dict], list[dict]]:
     """按关键词检索知识库片段，拼成命题资料。
 
-    没有关键词时退化为使用指定文档（或全部文档）的开头内容。
+    当用户明确勾选文档时，优先在选定文档内按关键词聚焦相关片段，
+    避免跨文档把上下文无关的段落混进命题资料；聚焦命中不足时回退
+    到原来的全库检索，保证组卷成功率不变。未勾选文档时保持原行为。
     同时返回引用文档元数据，供错题本回溯原始出处。
     """
     used_titles: list[str] = []
@@ -657,11 +659,47 @@ def _collect_material(
 
     doc_filter = set(doc_ids or [])
 
-    for keyword in keywords:
-        for hit in knowledge_service.search(keyword, per_keyword):
-            if doc_filter and hit["doc_id"] not in doc_filter:
+    # 勾选文档后先尝试文档内聚焦：只取选定文档中与该关键词最相关的
+    # 片段，来源更干净，减少模型把跨文档概念拼成题干的概率。
+    if doc_filter and keywords:
+        selected_docs = [
+            doc
+            for doc in knowledge_service.list_documents()
+            if doc["doc_id"] in doc_filter
+        ]
+        per_doc_limit = max(2, per_keyword)
+        for doc in selected_docs:
+            loaded = knowledge_service.load_document(doc["doc_id"])
+            raw_chunks = (loaded or {}).get("chunks") or []
+            if not raw_chunks:
                 continue
-            push(hit["title"], hit["text"], hit["chunk_id"], hit["doc_id"])
+            scored: list[tuple[int, int, str]] = []
+            terms = [
+                term
+                for keyword in keywords
+                for term in re.split(r"[\s/、，,;；()（）·]+", keyword)
+                if len(term) >= 2
+            ]
+            for index, text in enumerate(raw_chunks):
+                text = str(text or "")
+                if not text:
+                    continue
+                score = sum(text.count(term) for term in terms)
+                if score > 0:
+                    scored.append((-score, index, text))
+            scored.sort(key=lambda entry: (entry[0], entry[1]))
+            for _, index, text in scored[:per_doc_limit]:
+                chunk_id = f"{doc['doc_id']}-{index}"
+                push(doc["title"], text, chunk_id, doc["doc_id"])
+
+    if not blocks:
+        # 聚焦没有命中任何片段，或用户没有勾选文档：回到原来的按关键词
+        # 全库检索，避免引入新的“无资料可出题”失败。
+        for keyword in keywords:
+            for hit in knowledge_service.search(keyword, per_keyword):
+                if doc_filter and hit["doc_id"] not in doc_filter:
+                    continue
+                push(hit["title"], hit["text"], hit["chunk_id"], hit["doc_id"])
 
     if not blocks:
         for doc in knowledge_service.list_documents():
