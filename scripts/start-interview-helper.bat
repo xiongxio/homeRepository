@@ -233,7 +233,8 @@ for %%P in (%BACKEND_PORT% %FRONTEND_PORT%) do (
 )
 ping -n 3 127.0.0.1 >nul
 
-start "Interview Assistant Backend" /D "%BACKEND_DIR%" /MIN "%VENV_PY%" -m uvicorn app.main:app --host 127.0.0.1 --port %BACKEND_PORT%
+rem Keep the backend console visible: its access log shows every API request.
+start "Interview Assistant Backend" /D "%BACKEND_DIR%" "%VENV_PY%" -m uvicorn app.main:app --host 127.0.0.1 --port %BACKEND_PORT%
 
 echo       Waiting for backend...
 set "BACKEND_OK="
@@ -245,7 +246,7 @@ for /l %%i in (1,1,45) do (
     )
 )
 if not defined BACKEND_OK (
-    echo [WARN] Backend did not become ready within 45 seconds. Check the minimized backend window.
+    echo [WARN] Backend did not become ready within 45 seconds. Check the backend console window.
     goto :fail
 ) else (
     echo [%time:~0,8%]       Backend is ready.
@@ -285,7 +286,7 @@ echo ============================================
 echo   Startup complete
 echo   URL: http://127.0.0.1:%FRONTEND_PORT%/
 echo.
-echo   Keep the two minimized service windows open while using the app.
+echo   Keep the backend console and frontend window open while using the app.
 echo   Run stop.bat in the repository root when finished.
 echo ============================================
 echo.
