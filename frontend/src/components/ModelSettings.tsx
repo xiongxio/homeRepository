@@ -29,7 +29,7 @@ function createDraft(config: LlmConfig | null): Record<LlmProvider, ProviderDraf
     deepseek: {
       api_key: '',
       base_url: config?.deepseek.base_url ?? 'https://api.deepseek.com',
-      model: config?.deepseek.model ?? 'deepseek-chat',
+      model: config?.deepseek.model ?? 'deepseek-flash',
     },
     openai: {
       api_key: '',
@@ -44,7 +44,7 @@ function createDraft(config: LlmConfig | null): Record<LlmProvider, ProviderDraf
     minimax: {
       api_key: '',
       base_url: config?.minimax.base_url ?? 'https://api.minimaxi.com/v1',
-      model: config?.minimax.model ?? 'MiniMax-M2',
+      model: config?.minimax.model ?? 'MiniMax-M3',
     },
   }
 }

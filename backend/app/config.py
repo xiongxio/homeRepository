@@ -8,7 +8,9 @@ class Settings(BaseSettings):
     llm_provider: str = "deepseek"
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-chat"
+    # 旧别名 deepseek-chat / deepseek-reasoner 已于 2026-07-24 停用，
+    # 当前官方可用 ID 只有 deepseek-flash 与 deepseek-v4-pro。
+    deepseek_model: str = "deepseek-flash"
     ark_api_key: str = ""
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     ark_model: str = "doubao-seed-2-1-pro-260628"
@@ -16,8 +18,10 @@ class Settings(BaseSettings):
     top_questions_provider: str = ""
     top_questions_model: str = ""
     minimax_api_key: str = ""
+    # 国内区接口域名是 api.minimaxi.com（多一个 i），国际区是 api.minimax.io。
     minimax_base_url: str = "https://api.minimaxi.com/v1"
-    minimax_model: str = "MiniMax-M2"
+    # MiniMax-M2 已被官方归入 Legacy，当前主力模型是 M3（1M 上下文）。
+    minimax_model: str = "MiniMax-M3"
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"

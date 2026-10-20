@@ -99,6 +99,44 @@ def _provider_config(provider: str | None = None) -> tuple[str, str, str]:
     raise LlmError(f"不支持的 LLM_PROVIDER: {provider}")
 
 
+# 思考型模型（DeepSeek V4 系列等）把推理过程放在独立的 reasoning_content 字段，
+# 它与正文共享同一个 max_tokens 预算。组卷这类任务正文本身就有四五千 token，
+# 推理再吃掉几千，就会触发 finish_reason=length 且正文为空（content_len=0）。
+#
+# 实测（12K 字符资料 + 8 道题）：
+#   思考开启 mt=8000   → 65s，正文 4989，推理占用 5020（正文随时可能被挤空）
+#   思考开启 mt=32000  → 66s，正文 6076，推理占用 5255（加预算只会让推理更长）
+#   思考关闭 mt=8000   → 16s，正文 5032，推理占用 0（又快又稳）
+# 因此本项目的结构化 JSON 任务默认关闭思考；确有推理需要的调用方
+# 可以显式传 extra_body 打开。
+_REASONING_OFF_BODY = {
+    "deepseek": {"thinking": {"type": "disabled"}},
+}
+
+
+def _reasoning_body(provider: str | None) -> dict | None:
+    """返回该厂商默认的思考设置（关闭思考），不支持时返回 None。"""
+    body = _REASONING_OFF_BODY.get(provider or "")
+    return dict(body) if body else None
+
+
+def _is_reasoning_overflow(resp) -> bool:
+    """判断响应是否是"推理挤占了输出预算"：正文为空但推理内容有长度。
+
+    这类情况不是上游限流，而是 max_tokens 被推理吃光，
+    应当重试而不是直接让用户切模型。
+    """
+    try:
+        choice = resp.choices[0]
+    except (AttributeError, IndexError):
+        return False
+    content = getattr(choice.message, "content", None) or ""
+    if content.strip():
+        return False
+    reasoning = getattr(choice.message, "reasoning_content", None) or ""
+    return bool(reasoning.strip())
+
+
 def _completion(
     client: OpenAI,
     *,
@@ -109,6 +147,7 @@ def _completion(
     json_mode: bool,
     max_attempts: int = _COMPLETION_MAX_ATTEMPTS,
     retry_timeout: bool = True,
+    extra_body: dict | None = None,
 ):
     kwargs = {
         "model": model,
@@ -116,6 +155,8 @@ def _completion(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if extra_body:
+        kwargs["extra_body"] = extra_body
     use_json_mode = json_mode
     if use_json_mode:
         kwargs["response_format"] = {"type": "json_object"}
@@ -170,6 +211,7 @@ async def _acompletion(
     temperature: float,
     max_tokens: int,
     json_mode: bool,
+    extra_body: dict | None = None,
 ):
     """异步补全入口，错误分类、JSON 回退和重试策略与同步版本保持一致。"""
     kwargs = {
@@ -178,6 +220,8 @@ async def _acompletion(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if extra_body:
+        kwargs["extra_body"] = extra_body
     use_json_mode = json_mode
     if use_json_mode:
         kwargs["response_format"] = {"type": "json_object"}
@@ -257,6 +301,8 @@ def chat_json(
         {"role": "user", "content": user},
     ]
     last_error: Exception | None = None
+    # 结构化 JSON 任务默认关闭思考，避免推理把输出预算吃光。
+    reasoning_body = _reasoning_body(provider_name)
     for attempt in range(2):
         try:
             resp_iter = _completion(
@@ -268,6 +314,7 @@ def chat_json(
                 json_mode=True,
                 max_attempts=max_attempts,
                 retry_timeout=retry_timeout,
+                extra_body=reasoning_body,
             )
         except Exception as exc:
             raise LlmError(_classify_upstream_error(exc) or f"调用 LLM 失败: {exc}") from exc
@@ -285,6 +332,17 @@ def chat_json(
         )
         if choice_iter.finish_reason == "length":
             if not content_iter.strip():
+                # 推理挤占了输出预算：去掉思考设置重试一次，
+                # 真正的上游异常（限流等）才会走到下面的报错。
+                if reasoning_body and attempt == 0 and _is_reasoning_overflow(resp_iter):
+                    llm_logger.info(
+                        "reasoning overflow detected, retry without thinking override "
+                        "provider=%s model=%s",
+                        provider_name,
+                        model or resolved_model,
+                    )
+                    reasoning_body = None
+                    continue
                 raise LlmEmptyResponseError(
                     "模型返回了空内容且 finish_reason=length，上游可能出现异常（限流、账号异常等）。请稍后重试或切换其它模型。"
                 )
@@ -348,6 +406,7 @@ async def chat_json_async(
         {"role": "user", "content": user},
     ]
     last_error: Exception | None = None
+    reasoning_body = _reasoning_body(provider_name)
     async with AsyncOpenAI(
         api_key=api_key,
         base_url=base_url,
@@ -363,6 +422,7 @@ async def chat_json_async(
                     temperature=0.3 if attempt == 0 else 0.2,
                     max_tokens=max_tokens,
                     json_mode=True,
+                    extra_body=reasoning_body,
                 )
             except Exception as exc:
                 raise LlmError(_classify_upstream_error(exc) or f"调用 LLM 失败: {exc}") from exc
@@ -380,6 +440,16 @@ async def chat_json_async(
             )
             if choice_iter.finish_reason == "length":
                 if not content_iter.strip():
+                    # 推理挤占了输出预算：去掉思考设置重试一次。
+                    if reasoning_body and attempt == 0 and _is_reasoning_overflow(resp_iter):
+                        llm_logger.info(
+                            "reasoning overflow detected, retry without thinking override "
+                            "provider=%s model=%s",
+                            provider_name,
+                            model or resolved_model,
+                        )
+                        reasoning_body = None
+                        continue
                     raise LlmEmptyResponseError(
                         "模型返回了空内容且 finish_reason=length，上游可能出现异常（限流、账号异常等）。请稍后重试或切换其它模型。"
                     )
@@ -417,6 +487,7 @@ def chat_json_messages(
 ) -> dict:
     """多轮对话版本，用于模拟面试官逐轮提问。"""
     api_key, base_url, model = _provider_config()
+    provider_name = settings.llm_provider
     client = OpenAI(
         api_key=api_key,
         base_url=base_url,
@@ -424,6 +495,10 @@ def chat_json_messages(
         max_retries=0,
     )
     last_error: Exception | None = None
+    # 模拟面试对话需要推理能力，默认保留厂商默认思考设置；
+    # 但 max_tokens 只有 2000，推理极易挤空正文，溢出时关闭思考重试。
+    reasoning_body = None
+    fallback_body = _REASONING_OFF_BODY.get(provider_name)
     for attempt in range(retries + 1):
         try:
             resp = _completion(
@@ -433,6 +508,7 @@ def chat_json_messages(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 json_mode=True,
+                extra_body=reasoning_body,
             )
         except Exception as exc:
             raise LlmError(_classify_upstream_error(exc) or f"调用 LLM 失败: {exc}") from exc
@@ -441,6 +517,16 @@ def chat_json_messages(
         if choice.finish_reason == "length":
             # 截断的 JSON 无论重试几次都解析不了，直接报出真实原因。
             if not content.strip():
+                # 对话场景 max_tokens 较小，推理更容易挤空正文，关掉思考重试。
+                if fallback_body and attempt == 0 and _is_reasoning_overflow(resp):
+                    llm_logger.info(
+                        "reasoning overflow detected, retry with thinking disabled "
+                        "provider=%s model=%s",
+                        provider_name,
+                        model,
+                    )
+                    reasoning_body = fallback_body
+                    continue
                 raise LlmEmptyResponseError(
                     "模型返回了空内容且 finish_reason=length，上游可能出现异常（限流、账号异常等）。请稍后重试或切换其它模型。"
                 )

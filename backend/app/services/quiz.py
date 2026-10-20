@@ -82,6 +82,15 @@ def _minimax_provider() -> bool:
     return str(getattr(settings, "llm_provider", "")) == "minimax"
 
 
+def _deepseek_model() -> str:
+    """取 DeepSeek 的模型 ID。
+
+    旧别名 deepseek-chat 已于 2026-07-24 停用，硬编码会直接报 model not found，
+    因此统一读配置；配置为空时回落到当前有效的 deepseek-flash。
+    """
+    return settings.deepseek_model or "deepseek-flash"
+
+
 def _quiz_max_tokens() -> int:
     if _minimax_provider():
         try:
@@ -104,7 +113,7 @@ def _resolve_review_channel() -> tuple[str | None, str | None]:
     """复习模型不能把 A 厂商的 Model ID 传给 B 厂商的兼容接口。"""
     if _minimax_provider():
         if settings.deepseek_api_key:
-            return "deepseek", "deepseek-chat"
+            return "deepseek", _deepseek_model()
         if settings.ark_api_key and settings.ark_model:
             return "ark", settings.ark_model
         return "minimax", None
@@ -115,7 +124,7 @@ def _resolve_review_fallback_channel(primary_provider: str | None) -> tuple[str 
     """主复习通道慢时切到另一个已配置厂商，避免同一模型反复超时。"""
     primary = primary_provider or settings.llm_provider
     if settings.deepseek_api_key and primary != "deepseek":
-        return "deepseek", "deepseek-chat"
+        return "deepseek", _deepseek_model()
     if settings.ark_api_key and settings.ark_model and primary != "ark":
         return "ark", settings.ark_model
     if settings.minimax_api_key and settings.minimax_model and primary != "minimax":
@@ -1170,16 +1179,16 @@ def _request_quiz_raw_once(
     coverage_hint: list[str],
 ) -> dict:
     # Ark 的思考型模型生成完整试卷常超过 120 秒；组卷只依赖结构化 JSON，
-    # 这里优先复用已配置的 DeepSeek Chat 作为低延迟命题通道，避免主模型被单独卡住。
+    # 这里优先复用已配置的 DeepSeek 作为低延迟命题通道，避免主模型被单独卡住。
     quiz_provider = None
     quiz_model = None
     if settings.llm_provider == "ark" and settings.deepseek_api_key:
         quiz_provider = "deepseek"
-        quiz_model = "deepseek-chat"
+        quiz_model = _deepseek_model()
     elif settings.llm_provider == "minimax":
         if settings.deepseek_api_key:
             quiz_provider = "deepseek"
-            quiz_model = "deepseek-chat"
+            quiz_model = _deepseek_model()
         elif settings.ark_api_key and settings.ark_model:
             quiz_provider = "ark"
             quiz_model = settings.ark_model
