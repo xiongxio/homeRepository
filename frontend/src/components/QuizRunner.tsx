@@ -90,6 +90,13 @@ export function QuizRunner({ paper, onGraded, onCancel }: QuizRunnerProps) {
         </p>
       )}
 
+      {paper.shortfall_note && (
+        <p className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          <span>{paper.shortfall_note}</span>
+        </p>
+      )}
+
       <ol className="mt-5 space-y-5">
         {paper.questions.map((question, index) => {
           const picked = answers[question.question_id] ?? []

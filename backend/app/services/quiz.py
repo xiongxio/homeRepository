@@ -620,12 +620,16 @@ def _ensure_mastery_schema() -> dict:
 
 
 def _collect_material(
-    keywords: list[str], doc_ids: list[str], per_keyword: int = 4
+    keywords: list[str], doc_ids: list[str], per_keyword: int = 8
 ) -> tuple[str, list[str], list[dict], list[dict]]:
     """按关键词检索知识库片段，拼成命题资料。
 
     没有关键词时退化为使用指定文档（或全部文档）的开头内容。
     同时返回引用文档元数据，供错题本回溯原始出处。
+
+    per_keyword 不能太小：知识点少而题量多时，检索片段太少会让模型
+    反复围绕同一段内容命题，产出互相雷同的题（实测 4 块/关键词时
+    3 个知识点只召回 5067 字，20 道题里有近一半被判为重复）。
     """
     used_titles: list[str] = []
     used_docs: list[dict] = []
@@ -1817,7 +1821,18 @@ def generate_paper(
         if retry_error is not None:
             # LLM 兜底补题也走上游，让路由映射为 502，而不是 422。
             raise retry_error
-        raise QuizError("模型返回的有效题目不足，请稍后重试或更换关键词。")
+        # 差 1~2 道时不要整份作废：已命中的题目本身是可用的，
+        # 判分与前端都按实际题量走，丢弃只会让用户白白重来一轮。
+        shortfall = total - len(selected)
+        if 0 < shortfall <= max(1, total // 10):
+            quiz_logger.info(
+                "paper accepted with shortfall selected=%d/%d deficits=%s",
+                len(selected),
+                total,
+                deficits,
+            )
+        else:
+            raise QuizError("模型返回的有效题目不足，请稍后重试或更换关键词。")
 
     questions = []
     type_order = {qtype: index for index, qtype in enumerate(VALID_TYPES)}
@@ -1859,6 +1874,19 @@ def generate_paper(
         else:
             title = ("、".join(keywords[:3]) or "综合练习") + " 测验"
 
+    # 少量缺题时照常交付，但要告诉用户实际少了哪几道，避免误以为是自己看漏了。
+    shortfall_note = ""
+    if len(questions) < total:
+        missing = [
+            f"{TYPE_LABELS[qtype]}缺 {deficits[qtype]} 道"
+            for qtype in VALID_TYPES
+            if deficits[qtype] > 0
+        ]
+        shortfall_note = (
+            f"本次生成了 {len(questions)}/{total} 道（{'、'.join(missing)}），"
+            "题目已可直接作答。"
+        )
+
     paper = {
         "paper_id": paper_id,
         "title": title,
@@ -1869,6 +1897,7 @@ def generate_paper(
         "source_chunks": actual_chunks,
         "difficulty": difficulty,
         "questions": questions,
+        "shortfall_note": shortfall_note,
         "generation_context": {
             "kind": "weak_board" if mode == "weak_board" else "normal_quiz",
             "direction_id": direction_id,

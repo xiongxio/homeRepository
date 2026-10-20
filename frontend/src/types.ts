@@ -429,6 +429,7 @@ export interface QuizPaper {
   doc_titles: string[]
   difficulty: string
   questions: QuizQuestion[]
+  shortfall_note?: string
   generation_context?: {
     kind?: string
     fallback_reason?: string
