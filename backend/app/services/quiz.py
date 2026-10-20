@@ -1883,23 +1883,35 @@ def _latest_attempt_id() -> str:
     return paths[-1].stem if paths else ""
 
 
-def _current_mistake_topics(attempt_id: str, limit: int) -> list[str]:
+def _current_mistake_items(attempt_id: str, limit: int) -> list[dict]:
+    """收集本次答卷的错题记录（带原题字段），按知识点顺序去重。"""
     attempt_id = attempt_id or _latest_attempt_id()
     if not attempt_id:
         raise QuizError("还没有可用于重做的答卷，请先完成一套题。")
     attempt = get_attempt(attempt_id)
-    topics: list[str] = []
+    items: list[dict] = []
+    seen_topics: set[str] = set()
     for item in attempt.get("questions") or []:
         if item.get("is_correct"):
             continue
         topic = str(item.get("topic") or "未分类")
-        if topic not in topics:
-            topics.append(topic)
-        if len(topics) >= limit:
+        if topic in seen_topics:
+            continue
+        seen_topics.add(topic)
+        items.append(item)
+        if len(items) >= limit:
             break
-    if not topics:
+    if not items:
         raise QuizError("这份答卷没有错题，可以切换累计错题或重新选择知识点组卷。")
-    return topics
+    return items
+
+
+def _current_mistake_topics(attempt_id: str, limit: int) -> list[str]:
+    """本次答卷错题知识点，保持与错题项一致的去重顺序。"""
+    return [
+        str(item.get("topic") or "未分类")
+        for item in _current_mistake_items(attempt_id, limit)
+    ]
 
 
 def _all_mistake_topics(limit: int) -> list[str]:
@@ -2161,7 +2173,11 @@ def generate_mistake_paper(
     source_attempt_id = attempt_id or (_latest_attempt_id() if scope == "current" else "")
     fallback_mistakes: list[dict] = []
     if scope == "current":
-        topics = _current_mistake_topics(attempt_id, limit)
+        fallback_mistakes = _current_mistake_items(attempt_id, limit)
+        topics = [
+            str(item.get("topic") or "未分类")
+            for item in fallback_mistakes
+        ]
         doc_ids = _mistake_source_doc_ids(topics)
         counts = {
             "single": max(2, min(5, len(topics))),
