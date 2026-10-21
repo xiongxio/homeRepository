@@ -1,5 +1,6 @@
 """命题资料聚焦：选定文档时按关键词取相关片段，不足时回退全库检索。"""
 
+import inspect
 import unittest
 from unittest.mock import patch
 
@@ -89,7 +90,12 @@ class QuizMaterialFocusTests(unittest.TestCase):
         self.assertEqual(["接口测试讲义"], titles)
         self.assertEqual("doc-b", docs[0]["doc_id"])
         self.assertEqual("doc-b-1", chunks[0]["chunk_id"])
-        search.assert_called_once_with("超时重试", 4)
+        # 回退时按关键词走全库检索；每关键词取多少片段是可调参数，
+        # 这里断言它等于函数默认值，避免调参时误报。
+        default_per_keyword = inspect.signature(
+            quiz_service._collect_material
+        ).parameters["per_keyword"].default
+        search.assert_called_once_with("超时重试", default_per_keyword)
 
     def test_no_search_fallback_when_any_selected_doc_has_hits(self):
         with (
